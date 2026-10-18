@@ -1,0 +1,182 @@
+from django.shortcuts import get_object_or_404
+from rest_framework import generics
+from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.permissions import IsAuthenticated
+
+from services.accounts.permissions import CanManageCustomObjects
+from services.customers.scoping import visible_children_q
+
+from .models import CustomFieldDefinition, CustomObjectDefinition, CustomObjectRecord
+from .serializers import (
+    CustomFieldDefinitionSerializer,
+    CustomObjectDefinitionSerializer,
+    CustomObjectRecordSerializer,
+)
+
+
+class CustomObjectDefinitionListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/v1/custom-objects/definitions/ — every custom
+    object type the caller's own organisation has defined (GET, any
+    authenticated org member — everyone needs to know what object tabs
+    exist to use them, same "read is open, write is capability-gated"
+    shape as OrganisationSettingsView), or defines a new one (POST,
+    requiring the `manage_custom_objects` capability, method-gated here
+    since GET stays open to everyone)."""
+
+    serializer_class = CustomObjectDefinitionSerializer
+    pagination_class = None  # a real org's own custom objects — small, unpaginated.
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsAuthenticated(), CanManageCustomObjects()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        return CustomObjectDefinition.objects.filter(
+            organisation=self.request.user.organisation
+        ).prefetch_related("fields")
+
+
+class CustomObjectDefinitionDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/v1/custom-objects/definitions/<id>/ — same
+    read-open/write-gated split as the list view above. Deleting a
+    definition cascades to its own fields and every record ever created
+    against it (see the model's own on_delete=CASCADE) — same
+    "deleting the parent really does delete its children" behaviour as
+    every other cascading FK in this codebase."""
+
+    serializer_class = CustomObjectDefinitionSerializer
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), CanManageCustomObjects()]
+
+    def get_queryset(self):
+        return CustomObjectDefinition.objects.filter(organisation=self.request.user.organisation)
+
+
+class CustomFieldDefinitionListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/v1/custom-objects/definitions/<definition_id>/fields/
+    — POST requires `manage_custom_objects`; GET is open
+    to any org member for parity with the definition endpoints, though
+    the frontend normally reads fields nested on the definition itself
+    rather than calling this separately.
+
+    404s (not 403) for a definition_id outside the caller's own
+    organisation, same "check the parent once via get_object_or_404"
+    convention as AccountListCreateView's own."""
+
+    serializer_class = CustomFieldDefinitionSerializer
+    pagination_class = None  # one object's own fields — always a handful.
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsAuthenticated(), CanManageCustomObjects()]
+        return [IsAuthenticated()]
+
+    def _object_definition(self):
+        return get_object_or_404(
+            CustomObjectDefinition,
+            pk=self.kwargs["definition_id"],
+            organisation=self.request.user.organisation,
+        )
+
+    def get_queryset(self):
+        return self._object_definition().fields.all()
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["object_definition"] = self._object_definition()
+        return context
+
+
+class CustomFieldDefinitionDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE
+    /api/v1/custom-objects/definitions/<definition_id>/fields/<pk>/ —
+    requires `manage_custom_objects`, same reasoning as the field list
+    view's own POST."""
+
+    serializer_class = CustomFieldDefinitionSerializer
+    permission_classes = [IsAuthenticated, CanManageCustomObjects]
+
+    def get_queryset(self):
+        return CustomFieldDefinition.objects.filter(
+            object_definition_id=self.kwargs["definition_id"],
+            object_definition__organisation=self.request.user.organisation,
+        )
+
+
+class CustomObjectRecordListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/v1/custom-objects/records/?definition=<id>[&customer=<id>|&account=<id>]
+    — `?definition=` is always required; adding `&customer=<id>` or
+    `&account=<id>` scopes the GET to one specific parent's own records
+    (what CustomObjectsTab.tsx calls, on a Customer/Account's own
+    page) — omitting both instead lists every record of that object
+    type across the caller's whole organisation, any parent (what the
+    org-wide per-object page, pages/customObjects/
+    CustomObjectRecordsPage.tsx, calls from the sidebar's own real
+    "Custom Objects" section). POST always requires a real parent
+    (exactly one of `customer_id`/`account_id` in the body — see
+    CustomObjectRecordSerializer's own validation); there's no
+    "create without a parent" concept.
+
+    Paginated only for the org-wide case (a Customer/Account's own
+    handful of records stays unpaginated, same reasoning as the
+    per-object-definition views above) — see `pagination_class`.
+
+    Not capability-gated — adding/viewing a custom object *record* is like
+    adding a Task or a Note, open to any org member (see this app's own
+    plan/docstring on why only *defining* object/field types is
+    gated)."""
+
+    serializer_class = CustomObjectRecordSerializer
+    permission_classes = [IsAuthenticated]
+
+    @property
+    def pagination_class(self):
+        has_parent = self.request.query_params.get("customer") or self.request.query_params.get(
+            "account"
+        )
+        # PageNumberPagination alone (no page_size override) picks up the
+        # real global REST_FRAMEWORK["PAGE_SIZE"] — same default every
+        # other paginated list in this codebase already uses.
+        return None if has_parent else PageNumberPagination
+
+    def get_queryset(self):
+        definition_id = self.request.query_params.get("definition")
+        customer_id = self.request.query_params.get("customer")
+        account_id = self.request.query_params.get("account")
+        if not definition_id:
+            raise ValidationError("?definition=<id> is required.")
+
+        queryset = CustomObjectRecord.objects.filter(
+            object_definition_id=definition_id,
+            object_definition__organisation=self.request.user.organisation,
+        )
+        # Visibility first in every branch, then the requested parent
+        # narrows it further. Doing it the other way round — trusting a
+        # raw `?customer=` id and only checking its organisation — is
+        # what let any member read another owner's records by guessing
+        # an id.
+        queryset = queryset.filter(visible_children_q(self.request.user))
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+        elif account_id:
+            queryset = queryset.filter(account_id=account_id)
+        return queryset.distinct()
+
+
+class CustomObjectRecordDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/v1/custom-objects/records/<id>/ — scoped to
+    the records the caller can see via either parent, same "match on
+    customer OR account, whichever is set" shape the model itself uses.
+    PATCH and DELETE inherit that scoping from the queryset, so you
+    can't edit or delete a record on an account you can't open."""
+
+    serializer_class = CustomObjectRecordSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return CustomObjectRecord.objects.filter(visible_children_q(self.request.user)).distinct()

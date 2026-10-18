@@ -1,0 +1,6 @@
+# Local only (listed in .git/info/exclude): Postgres 16 with pgvector, as
+# Cloud SQL. The pgvector-embeddings change makes the same switch in
+# docker-compose.yml; delete this file once that is on main.
+services:
+  db:
+    image: pgvector/pgvector:pg16

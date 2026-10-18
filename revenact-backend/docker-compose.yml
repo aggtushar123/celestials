@@ -1,0 +1,139 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16  # Postgres 16 + pgvector, as Cloud SQL
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: revenact
+      POSTGRES_PASSWORD: revenact
+      POSTGRES_DB: revenact
+    ports:
+      - "5432:5432"
+    volumes:
+      - revenact_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U revenact"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Multiplayer Copilot Phase 2b's own real-time push (see
+  # services/copilot/consumers.py) — the channel layer Django Channels
+  # uses to fan a push out to every real connected participant, real
+  # since more than one server process needs to share it (see
+  # config/settings.py's own CHANNEL_LAYERS docstring). Run standalone
+  # for local dev — `docker compose up -d redis` — the user's own
+  # explicit choice over installing Redis on the machine directly (via
+  # Homebrew) or skipping it for an in-memory-only channel layer.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides .env's localhost DATABASE_URL/REDIS_URL — inside the
+      # compose network these are reachable at the service names, not
+      # localhost.
+      DATABASE_URL: postgres://revenact:revenact@db:5432/revenact  # soc2:ignore dev-only local compose db
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
+
+  # Account health goes stale on its own: `health_score` counts days since
+  # the last touch and open tickets, and `HealthSnapshot` is what the Health
+  # Overview's Movement tab charts — neither moves unless something runs.
+  # `run_health_maintenance` does both (see its own docstring).
+  #
+  # A sleep loop rather than cron-in-the-image or a task queue. There is no
+  # celery here, and installing cron would mean a second process supervisor
+  # and its logs going somewhere other than `docker compose logs`. The job is
+  # idempotent — recalculation recomputes from scratch and the snapshot writes
+  # at most one row per customer per month — so a tick landing at an odd hour,
+  # firing twice after a restart, or being missed entirely costs nothing.
+  #
+  # The tradeoff: the run time drifts by however long the job takes and by
+  # when the container last restarted, so this is "about daily", not "00:05
+  # daily". Swap in a real scheduler when there's a deployment to hang one on.
+  scheduler:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://revenact:revenact@db:5432/revenact  # soc2:ignore dev-only local compose db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "while true; do
+               python manage.py run_health_maintenance || echo 'health maintenance failed; retrying tomorrow';
+               sleep 86400;
+             done"
+
+  # Message intake (services.agents.intake): every 5 minutes, both lanes: the
+  # interval run (each workspace whose interval is due reads what was filed
+  # since its last run and proposes bundles) and the fast lane (urgent threads
+  # after 2 quiet minutes, within its caps). Same sleep-loop shape as the
+  # scheduler; no task queue by design. Each workspace, tick and thread is
+  # claimed, so an overlap costs nothing.
+  agentsignals:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://revenact:revenact@db:5432/revenact  # soc2:ignore dev-only local compose db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "while true; do
+               python manage.py run_agent_signals || echo 'agent signals failed; retrying in five minutes';
+               sleep 300;
+             done"
+
+  # Campaign and survey sends: Send now only claims a send, and this emails
+  # its queued people within about a minute (and resumes any send a crash
+  # cut off). Safe to overlap with itself; two queries when nothing waits.
+  sender:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://revenact:revenact@db:5432/revenact  # soc2:ignore dev-only local compose db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "while true; do
+               python manage.py deliver_pending || echo 'deliver_pending failed; retrying in a minute';
+               sleep 60;
+             done"
+
+volumes:
+  revenact_pgdata:

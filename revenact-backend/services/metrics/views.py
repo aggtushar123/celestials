@@ -1,0 +1,638 @@
+"""The metric layer over the API.
+
+Gated on `view_all_accounts`, not on `IsAuthenticated`: every number here is
+the whole organisation's, and a CSM whose book is scoped to their own
+customers would otherwise read the company's ARR off this endpoint.
+"""
+
+import logging
+
+from django.db import transaction
+from rest_framework import generics, status, views
+from rest_framework.exceptions import NotFound
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from core import audit
+from services.accounts.permissions import CanManageOrgSettings, CanViewAllAccounts
+
+from .delivery import NotASlackHook, check_destination, send
+from .models import COMPANY_SCOPE, BriefSchedule, MetricSnapshot
+from .registry import BY_KEY, METRICS, as_of, compute_all
+from .signals import describe as _describe
+from .signals import latest_by_member as _latest_by_member
+from .signals import number as _number
+
+logger = logging.getLogger(__name__)
+
+
+class MetricListView(views.APIView):
+    """GET /api/v1/metrics/ — every metric, its value now, and the last
+    month-end it was recorded at, so a screen can show the number and
+    which way it has moved without a second request."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request):
+        organisation = request.user.organisation
+        values = compute_all(organisation)
+
+        latest = {}
+        for row in MetricSnapshot.objects.filter(
+            organisation=organisation, dimension="", member=""
+        ).order_by("metric", "-period_end"):
+            latest.setdefault(row.metric, row)
+
+        metrics = []
+        for metric in METRICS:
+            now = _number(values[metric.key])
+            previous = latest.get(metric.key)
+            previous_value = _number(previous.value) if previous else None
+            metrics.append(
+                {
+                    **_describe(metric),
+                    "value": now,
+                    "previous": (
+                        {"period_end": previous.period_end.isoformat(), "value": previous_value}
+                        if previous
+                        else None
+                    ),
+                    # Null when either side is unmeasured: a change from
+                    # "unknown" to 40 is not a rise of 40.
+                    "change": (
+                        round(now - previous_value, 4)
+                        if now is not None and previous_value is not None
+                        else None
+                    ),
+                }
+            )
+
+        return Response(
+            {"as_of": as_of().isoformat(), "currency": organisation.currency, "metrics": metrics}
+        )
+
+
+class MetricHistoryView(views.APIView):
+    """GET /api/v1/metrics/<key>/history/ — the month-end series for one
+    metric, oldest first. A month with no row is absent, not zero."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request, key):
+        metric = BY_KEY.get(key)
+        if metric is None:
+            raise NotFound(f"No metric called {key!r}.")
+
+        points = [
+            {"period_end": row.period_end.isoformat(), "value": _number(row.value)}
+            for row in MetricSnapshot.objects.filter(
+                organisation=request.user.organisation, metric=key, dimension="", member=""
+            ).order_by("period_end")
+        ]
+        return Response(
+            {
+                "metric": _describe(metric),
+                "currency": request.user.organisation.currency,
+                "points": points,
+            }
+        )
+
+
+def _members_payload(organisation, metric, dimension):
+    from .registry import compute_slice
+
+    latest = _latest_by_member(organisation, metric.key, dimension)
+    members = []
+    for member, label, value in compute_slice(organisation, metric, dimension):
+        now = _number(value)
+        previous = latest.get(member)
+        previous_value = _number(previous.value) if previous else None
+        members.append(
+            {
+                "member": member,
+                "label": label,
+                "value": now,
+                "previous": (
+                    {"period_end": previous.period_end.isoformat(), "value": previous_value}
+                    if previous
+                    else None
+                ),
+                "change": (
+                    round(now - previous_value, 4)
+                    if now is not None and previous_value is not None
+                    else None
+                ),
+            }
+        )
+    # Largest first, unmeasured last — the reader wants the biggest member on top.
+    members.sort(key=lambda m: (m["value"] is None, -(m["value"] or 0)))
+    return members
+
+
+class MetricSliceView(views.APIView):
+    """GET /api/v1/metrics/<key>/by/<dimension>/ — one metric cut one way,
+    every member with its value now and its move since the last month-end.
+    The "why" layer's raw material: ARR at risk by product, NRR by owner."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request, key, dimension):
+        from .registry import DIMENSION_LABELS
+
+        metric = BY_KEY.get(key)
+        if metric is None:
+            raise NotFound(f"No metric called {key!r}.")
+        if dimension not in metric.slices:
+            raise NotFound(
+                f"{key!r} cannot be cut by {dimension!r}; it can by "
+                f"{', '.join(sorted(metric.slices)) or 'nothing'}."
+            )
+        organisation = request.user.organisation
+        return Response(
+            {
+                "metric": _describe(metric),
+                "dimension": {"key": dimension, "label": DIMENSION_LABELS[dimension]},
+                "currency": organisation.currency,
+                "members": _members_payload(organisation, metric, dimension),
+            }
+        )
+
+
+class MetricSignalsView(views.APIView):
+    """GET /api/v1/metrics/signals/ — the metrics that moved materially since
+    the last month-end, worst first, each naming the member that moved it
+    most. Empty until a second month-end exists to compare against; the
+    response says so rather than inventing a baseline. The rule lives in
+    signals.py, shared with the management brief."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request):
+        from .signals import signals_for
+
+        return Response(signals_for(request.user.organisation))
+
+
+def _brief_payload(brief):
+    return {
+        "id": brief.id,
+        "as_of": brief.as_of.isoformat(),
+        "baseline": brief.baseline.isoformat() if brief.baseline else None,
+        "headline": brief.headline,
+        "body": brief.body,
+        "watch": brief.watch,
+        "generated_at": brief.generated_at.isoformat(),
+        "generated_by": brief.generated_by.name if brief.generated_by else None,
+    }
+
+
+class GraphView(views.APIView):
+    """GET /api/v1/metrics/graph/ — the knowledge graph: owners, customers,
+    products, open initiatives and pending proposals, with the real
+    relations between them and the figures the dashboards already draw.
+    Organisation-wide, so gated like the rest of the brain."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request):
+        from .graph import build_graph
+
+        return Response(build_graph(request.user.organisation))
+
+
+class BriefView(views.APIView):
+    """GET /api/v1/metrics/brief/ — the latest management brief, or
+    `{"brief": null}` before one has been written. Reading is free."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request):
+        from .models import Brief
+
+        brief = Brief.objects.filter(
+            organisation=request.user.organisation, scope_key=COMPANY_SCOPE
+        ).first()
+        return Response({"brief": _brief_payload(brief) if brief else None})
+
+
+class BriefGenerateView(views.APIView):
+    """POST /api/v1/metrics/brief/generate/ — write a new brief from the
+    metric layer as it stands. A real, paid model call, so an explicit
+    action rather than a side effect of viewing. Error mapping matches
+    HeadlineGenerateView's: 503 when the provider isn't configured, 502
+    when the call fails, 422 when there is nothing to write about."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def post(self, request):
+        from rest_framework import status
+
+        from services.copilot.anthropic_client import (
+            BudgetExceeded,
+            CopilotNotConfigured,
+            CopilotRequestFailed,
+        )
+
+        from .brief import NothingToBrief, generate_brief
+
+        try:
+            brief = generate_brief(request.user.organisation, generated_by=request.user)
+        except NothingToBrief as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        except BudgetExceeded as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except CopilotNotConfigured as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except CopilotRequestFailed as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({"brief": _brief_payload(brief)}, status=status.HTTP_201_CREATED)
+
+
+def _explanation_payload(row):
+    from .signals import number
+
+    return {
+        "id": row.id,
+        "metric": row.metric,
+        "metric_label": row.inputs.get("metric", {}).get("label", row.metric),
+        "as_of": row.as_of.isoformat(),
+        "baseline": row.baseline.isoformat() if row.baseline else None,
+        "value": number(row.value),
+        "previous_value": number(row.previous_value),
+        "text": row.text,
+        "evidence": row.evidence,
+        "generated_at": row.generated_at.isoformat(),
+        "generated_by": row.generated_by.name if row.generated_by else None,
+    }
+
+
+class MetricExplanationView(views.APIView):
+    """GET /api/v1/metrics/<key>/explanation/ — the latest explanation of
+    one metric, or `{"explanation": null}` before one is written. Reading
+    is free; an unknown key is a 404."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request, key):
+        from django.http import Http404
+
+        from .models import Explanation
+        from .registry import BY_KEY
+
+        if key not in BY_KEY:
+            raise Http404(f"No metric called {key!r}.")
+        row = Explanation.objects.filter(
+            organisation=request.user.organisation, metric=key, scope_key=COMPANY_SCOPE
+        ).first()
+        return Response({"explanation": _explanation_payload(row) if row else None})
+
+
+class MetricExplainView(views.APIView):
+    """POST /api/v1/metrics/<key>/explain/ — ask why this number is where
+    it is. A real, paid model call; error mapping as the brief's, and a
+    404 for a key the registry lacks."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def post(self, request, key):
+        from rest_framework import status
+
+        from services.copilot.anthropic_client import (
+            BudgetExceeded,
+            CopilotNotConfigured,
+            CopilotRequestFailed,
+        )
+
+        from .explain import NothingToExplain, UnknownMetric, explain
+
+        try:
+            row = explain(request.user.organisation, key, generated_by=request.user)
+        except UnknownMetric as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except NothingToExplain as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        except BudgetExceeded as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except CopilotNotConfigured as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except (CopilotRequestFailed, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({"explanation": _explanation_payload(row)}, status=status.HTTP_201_CREATED)
+
+
+class _InitiativeViewMixin:
+    """Shared by the list and detail: the organisation's own initiatives,
+    with one `Figures` per request so a page of them runs the rollups once."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get_serializer_class(self):
+        from .serializers import InitiativeSerializer
+
+        return InitiativeSerializer
+
+    def get_queryset(self):
+        from .models import Initiative
+
+        return Initiative.objects.filter(
+            organisation=self.request.user.organisation
+        ).select_related("owner")
+
+    def get_serializer_context(self):
+        from .initiatives import Figures
+
+        context = super().get_serializer_context()
+        if not hasattr(self, "_figures"):
+            self._figures = Figures(self.request.user.organisation)
+        context["figures"] = self._figures
+        return context
+
+    def perform_create(self, serializer):
+        # The write and its audit row succeed or fail together.
+        with transaction.atomic():
+            initiative = serializer.save()
+            audit.record(  # SOC2:LOG-01
+                "initiative.created",
+                request=self.request,
+                target=initiative,
+                target_repr=f"Initiative {initiative.pk}",
+                metadata={"scope": COMPANY_SCOPE, "metric": initiative.metric},
+            )
+
+    def perform_update(self, serializer):
+        before = {name: getattr(serializer.instance, name) for name in serializer.validated_data}
+        with transaction.atomic():
+            initiative = serializer.save()
+            fields = sorted(
+                name for name, old in before.items() if getattr(initiative, name) != old
+            )
+            if fields:
+                audit.record(  # SOC2:LOG-01
+                    "initiative.updated",
+                    request=self.request,
+                    target=initiative,
+                    target_repr=f"Initiative {initiative.pk}",
+                    metadata={"scope": COMPANY_SCOPE, "fields": fields},
+                )
+
+
+class InitiativeListCreateView(_InitiativeViewMixin, generics.ListCreateAPIView):
+    """GET/POST /api/v1/metrics/initiatives/ — management's decisions, each
+    judged live against the metric layer. Unpaginated: a board of decisions
+    is tens of rows, and the page wants all of them."""
+
+    pagination_class = None
+
+
+class InitiativeDetailView(_InitiativeViewMixin, generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/v1/metrics/initiatives/<id>/. Closing one
+    (status done or abandoned) stamps closed_at; reopening clears it."""
+
+
+def _feedback_payload(entry):
+    return {
+        "id": entry.id,
+        "kind": entry.kind,
+        "kind_display": entry.get_kind_display(),
+        "subject_type": entry.subject_type,
+        "subject_id": entry.subject_id,
+        "subject_label": entry.subject_label,
+        "before": entry.before,
+        "after": entry.after,
+        "note": entry.note,
+        "made_by": entry.made_by.name if entry.made_by else None,
+        "created_at": entry.created_at.isoformat(),
+    }
+
+
+class FeedbackListView(views.APIView):
+    """GET /api/v1/metrics/feedback/ — the feedback log, newest first;
+    `?kind=` narrows. Management-facing: it is the record of how often
+    the system is wrong and about what, across every book."""
+
+    permission_classes = [CanViewAllAccounts]
+
+    def get(self, request):
+        from .models import Feedback
+
+        queryset = Feedback.objects.filter(organisation=request.user.organisation).select_related(
+            "made_by"
+        )
+        wanted = request.query_params.get("kind")
+        if wanted in Feedback.Kind.values:
+            queryset = queryset.filter(kind=wanted)
+        entries = list(queryset[:200])
+        counts = {
+            kind: Feedback.objects.filter(organisation=request.user.organisation, kind=kind).count()
+            for kind in Feedback.Kind.values
+        }
+        return Response({"counts": counts, "feedback": [_feedback_payload(e) for e in entries]})
+
+
+class ClassificationCorrectionView(views.APIView):
+    """PATCH /api/v1/interactions/<kind>/<id>/classification/ — a person
+    correcting the model's tags on one ticket, email or call. Any member
+    who can see the record may correct it; the correction is logged and
+    outranks every later reclassify."""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, kind, pk):
+        from django.shortcuts import get_object_or_404
+        from rest_framework import status
+
+        from services.customers.scoping import visible_children_q
+
+        from .feedback import INTERACTION_MODELS, InvalidCorrection, correct_classification
+
+        model = INTERACTION_MODELS.get(kind)
+        if model is None:
+            return Response(
+                {"detail": f"No interaction kind {kind!r}."}, status=status.HTTP_404_NOT_FOUND
+            )
+        rows = model.objects.filter(visible_children_q(request.user))
+        if kind == "email":
+            from services.mail.visibility import visible_emails_q
+
+            # SOC2:AUTH-02 an email's classification is its reader's to see and correct
+            rows = rows.filter(visible_emails_q(request.user))
+        record_ = get_object_or_404(rows.distinct(), pk=pk)
+        fields = {
+            key: request.data[key]
+            for key in ("area", "category", "subcategory", "sentiment")
+            if key in request.data
+        }
+        if not fields:
+            return Response(
+                {"detail": "Send at least one of area, category, subcategory, sentiment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            record_, entry = correct_classification(
+                request.user.organisation,
+                record_,
+                fields,
+                made_by=request.user,
+                note=str(request.data.get("note") or ""),
+            )
+        except InvalidCorrection as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "id": f"{kind}:{record_.pk}",
+                "keys": {
+                    "area": record_.ai_area,
+                    "category": record_.ai_category,
+                    "subcategory": record_.ai_subcategory,
+                    "sentiment": record_.sentiment,
+                },
+                "labels": {
+                    "area": record_.get_ai_area_display() or "",
+                    "category": record_.get_ai_category_display() or "",
+                    "subcategory": record_.get_ai_subcategory_display() or "",
+                    "sentiment": record_.get_sentiment_display(),
+                },
+                "corrected": record_.classification_corrected_at is not None,
+                "feedback": _feedback_payload(entry) if entry else None,
+            }
+        )
+
+
+class BriefScheduleView(views.APIView):
+    """GET/POST/PATCH/DELETE /api/v1/metrics/brief/schedule/
+
+    Where the management brief goes and when. One per organisation, and
+    configuration rather than content, so it is gated on
+    `manage_org_settings` like webhooks are — not on who may read a brief.
+
+    The Slack URL is a credential: anyone holding it can post to that
+    channel. It goes in and is never returned; `destination_hint` is the
+    last few characters, enough to recognise which hook is set."""
+
+    permission_classes = [IsAuthenticated, CanManageOrgSettings]
+
+    def _schedule(self, request):
+        return BriefSchedule.objects.filter(organisation=request.user.organisation).first()
+
+    def _body(self, schedule):
+        if schedule is None:
+            return {
+                "cadence": None,
+                "destination_hint": "",
+                "weekday": None,
+                "day": None,
+                "is_active": False,
+                "last_sent_at": None,
+            }
+        return {
+            "cadence": schedule.cadence,
+            "destination_hint": schedule.destination_hint,
+            "weekday": schedule.weekday,
+            "day": schedule.day,
+            "is_active": schedule.is_active,
+            "last_sent_at": schedule.last_sent_at,
+        }
+
+    def get(self, request):
+        return Response(self._body(self._schedule(request)))
+
+    def post(self, request):
+        destination = (request.data.get("destination") or "").strip()
+        try:
+            check_destination(destination)
+        except NotASlackHook as exc:
+            return Response({"detail": str(exc)}, status=400)
+        fields = self._fields(request.data)
+        if isinstance(fields, Response):
+            return fields
+        schedule, _ = BriefSchedule.objects.update_or_create(
+            organisation=request.user.organisation,
+            defaults={**fields, "destination": destination, "created_by": request.user},
+        )
+        audit.record(
+            "brief.schedule",
+            request=request,
+            target=schedule,
+            metadata={"cadence": schedule.cadence, "to": schedule.destination_hint},
+        )
+        return Response(self._body(schedule), status=status.HTTP_201_CREATED)
+
+    def patch(self, request):
+        schedule = self._schedule(request)
+        if schedule is None:
+            return Response({"detail": "Nothing is scheduled yet."}, status=404)
+        if "destination" in request.data:
+            destination = (request.data.get("destination") or "").strip()
+            try:
+                check_destination(destination)
+            except NotASlackHook as exc:
+                return Response({"detail": str(exc)}, status=400)
+            schedule.destination = destination
+        fields = self._fields(request.data, current=schedule)
+        if isinstance(fields, Response):
+            return fields
+        for key, value in fields.items():
+            setattr(schedule, key, value)
+        schedule.save()
+        audit.record(
+            "brief.schedule",
+            request=request,
+            target=schedule,
+            metadata={"cadence": schedule.cadence, "to": schedule.destination_hint},
+        )
+        return Response(self._body(schedule))
+
+    def delete(self, request):
+        schedule = self._schedule(request)
+        if schedule is not None:
+            schedule.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _fields(self, data, current=None):
+        """The scheduling fields, validated. A bad number is a 400 rather
+        than a schedule that never fires and never says why."""
+        out = {}
+        cadence = data.get("cadence", current.cadence if current else BriefSchedule.Cadence.WEEKLY)
+        if cadence not in BriefSchedule.Cadence.values:
+            return Response({"detail": f"Unknown cadence {cadence!r}."}, status=400)
+        out["cadence"] = cadence
+        for key, low, high, fallback in (("weekday", 0, 6, 0), ("day", 1, 31, 1)):
+            if key in data:
+                try:
+                    value = int(data[key])
+                except (TypeError, ValueError):
+                    return Response({"detail": f"{key} must be a number."}, status=400)
+                if not low <= value <= high:
+                    return Response(
+                        {"detail": f"{key} must be between {low} and {high}."}, status=400
+                    )
+                out[key] = value
+            elif current is None:
+                out[key] = fallback
+        if "is_active" in data:
+            out["is_active"] = bool(data["is_active"])
+        elif current is None:
+            out["is_active"] = True
+        return out
+
+
+class BriefSendNowView(views.APIView):
+    """POST /api/v1/metrics/brief/schedule/send/ — post the latest brief to
+    the configured channel right now, so a new schedule can be proved
+    before anybody waits a week for it."""
+
+    permission_classes = [IsAuthenticated, CanManageOrgSettings]
+
+    def post(self, request):
+        schedule = BriefSchedule.objects.filter(organisation=request.user.organisation).first()
+        if schedule is None:
+            return Response({"detail": "Nothing is scheduled yet."}, status=404)
+        try:
+            sent, detail = send(schedule, actor=request.user, request=request)
+        except NotASlackHook as exc:
+            return Response({"detail": str(exc)}, status=400)
+        if not sent and detail != "No brief has been written yet.":
+            return Response({"sent": False, "detail": detail}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({"sent": sent, "detail": detail})

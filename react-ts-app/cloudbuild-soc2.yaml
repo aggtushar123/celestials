@@ -1,0 +1,85 @@
+# SOC 2 security gates on Cloud Build (GitHub Actions is billing-blocked;
+# this replaces .github/workflows/soc2-gates.yml job for job). Started on
+# every pull request to main by the `frontend-soc2` trigger in
+# revenact-deploy/terraform/cloudbuild.tf; the Cloud Build GitHub app
+# reports it on the PR as one check. Every gate runs to the end and records
+# its exit code, so one build reports every failing gate; `verdict` then
+# fails the build if any gate failed. Tool images are pinned (SEC-03).
+#   secret-scan      SEC-01  gitleaks (.gitleaks.toml)
+#   dependency-scan  SEC-03  npm audit of the production dependencies
+#   static-analysis  SEC-04  semgrep security rulesets (React, TypeScript)
+#   soc2-scan        EVD-01  the soc2-dev heuristic scanner + control-map drift
+steps:
+  - id: secret-scan
+    name: zricethezav/gitleaks:v8.30.0
+    waitFor: ["-"]
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        mkdir -p /workspace/.gates
+        # Full history when the build has it; the working tree otherwise.
+        if [ -d .git ]; then mode=git; else mode=dir; fi
+        gitleaks "$$mode" --redact --verbose .
+        echo $$? > /workspace/.gates/secret-scan
+
+  - id: dependency-scan
+    name: node:22
+    waitFor: ["-"]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        mkdir -p /workspace/.gates
+        npm audit --omit=dev --audit-level=high
+        echo $$? > /workspace/.gates/dependency-scan
+
+  - id: static-analysis
+    name: semgrep/semgrep:1.180.0
+    waitFor: ["-"]
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        mkdir -p /workspace/.gates
+        # The image refuses to run unless the code is at /src (it is in /workspace).
+        rmdir /src 2>/dev/null; ln -sfn /workspace /src
+        semgrep scan --error --metrics=off \
+          --config p/security-audit --config p/secrets --config p/owasp-top-ten \
+          --config p/react --config p/typescript \
+          --exclude .claude --exclude node_modules --exclude dist --exclude '**/*.test.*'
+        echo $$? > /workspace/.gates/static-analysis
+
+  - id: soc2-scan
+    name: python:3.13-slim
+    waitFor: ["-"]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        mkdir -p /workspace/.gates
+        python3 .claude/skills/soc2-dev/scripts/control_map.py . || true
+        python3 .claude/skills/soc2-dev/scripts/soc2_scan.py . --format md --fail-on critical
+        echo $$? > /workspace/.gates/soc2-scan
+
+  - id: verdict
+    name: bash:5.2
+    waitFor: [secret-scan, dependency-scan, static-analysis, soc2-scan]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        failed=0
+        for gate in secret-scan dependency-scan static-analysis soc2-scan; do
+          code=$$(cat "/workspace/.gates/$$gate" 2>/dev/null || echo missing)
+          if [ "$$code" = 0 ]; then echo "PASS  $$gate"; else echo "FAIL  $$gate ($$code)"; failed=1; fi
+        done
+        exit $$failed
+
+options:
+  # The default machine (e2-standard-2): the gates are scanners and lint, a few
+  # minutes, and Cloud Build's free 2,500 build-minutes a month cover only this
+  # machine. The test shards (cloudbuild-ci.yaml) keep E2_HIGHCPU_8.
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s

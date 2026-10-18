@@ -1,0 +1,62 @@
+# SOC 2 configuration for react-ts-app (Revenact web frontend).
+# The API and data controls live in revenact-backend/.soc2/; this file covers
+# the browser client only. Organisational policies deferred (product in development).
+
+company: "Revenact"
+system_name: "Revenact web app (React/Vite SPA)"
+owner: "@aggtushar123"
+
+tsc:
+  security: true
+  availability: false
+  confidentiality: true
+  processing_integrity: false
+  privacy: false
+
+data:
+  pii: true
+  phi: false
+  payment_card: false
+  multi_tenant: true
+  classification_default: internal
+
+auth:
+  mfa_required_for: [admin, privileged]
+  external_idp: false
+  password_min_length: 12
+  password_max_age_days: 0
+  password_breach_check: true
+  access_token_ttl_minutes: 60
+  refresh_token_ttl_days: 7
+  idle_timeout_minutes: 30
+  lockout_after_failures: 10
+
+retention_days:
+  audit_logs: 365
+  application_logs: 90
+  user_pii_after_account_close: 30
+  backups: 35
+  support_tickets: 730
+
+patch_sla_days:
+  critical: 7
+  high: 30
+  medium: 90
+  low: 180
+
+policies_dir: docs/policies
+
+stack:
+  language: node
+  framework: react
+  ci: github
+  cloud: azure
+
+scan_ignore:
+  - node_modules
+  - dist
+  - build
+  - "**/*.test.*"
+  - "**/src/test/**"
+
+public_routes: []

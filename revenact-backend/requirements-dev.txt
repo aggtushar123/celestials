@@ -1,0 +1,10 @@
+# Dev-only tooling. Install with: pip install -r requirements-dev.txt
+-r requirements.txt
+
+# The local embedding provider (EMBEDDINGS_PROVIDER=local, the default for
+# development and the test suite). Production uses Gemini and leaves it, and
+# PyTorch with it, out of the image.
+sentence-transformers==6.1.0
+
+ruff==0.16.10
+tblib==3.2.2

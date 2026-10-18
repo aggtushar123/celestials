@@ -1,0 +1,14 @@
+# gitleaks configuration (SOC2:SEC-01). Default rules plus allowlists for the
+# values that are deliberately not secrets (test fixtures, the bundled skill).
+title = "revenact-frontend"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secrets"
+paths = [
+  '''^\.claude/''',
+  '''\.test\.(ts|tsx)$''',
+  '''^src/test/''',
+]

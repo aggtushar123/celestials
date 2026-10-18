@@ -1,0 +1,400 @@
+"""A contact's sentiment is read from their calls, emails and tickets."""
+
+from datetime import date, datetime, timedelta
+from datetime import timezone as dt_timezone
+from unittest.mock import patch
+
+from django.core.management import call_command
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APITestCase
+
+from services.accounts.models import Organisation, User
+from services.customers import contact_sentiment
+from services.customers.models import Account, Call, Contact, Customer, Email, Ticket
+
+NOW = timezone.now()
+
+
+class Fixture(APITestCase):
+    def setUp(self):
+        from services.copilot.anthropic_client import CopilotNotConfigured
+
+        no_model = patch(
+            "services.customers.classification.get_completion",
+            side_effect=CopilotNotConfigured("no model in tests"),
+        )
+        no_model.start()
+        self.addCleanup(no_model.stop)
+        self.org = Organisation.objects.create(name="Acme")
+        self.carl = User.objects.create_user(
+            email="carl@acme.io", password="x", name="Carl", organisation=self.org
+        )
+        self.pizza = Customer.objects.create(organisation=self.org, name="Pizza Hut")
+        self.hut_uk = Account.objects.create(name="Pizza Hut UK")
+        self.hut_uk.customers.add(self.pizza)
+        self.sam = Contact.objects.create(
+            customer=self.pizza, name="Sam Pizza", email="sam@pizzahut.com", sentiment="neutral"
+        )
+        self.uma = Contact.objects.create(
+            account=self.hut_uk, name="Uma Hut", email="uma@pizzahut.co.uk", sentiment="positive"
+        )
+
+    def call(self, sentiment, days_ago=1, participants=(), **kw):
+        call = Call.objects.create(
+            customer=self.pizza,
+            title=kw.pop("title", "Call"),
+            host_name="Carl",
+            occurred_at=NOW - timedelta(days=days_ago),
+            sentiment=sentiment,
+            ai_classified_at=NOW,
+            **kw,
+        )
+        call.participants.set(participants)
+        return call
+
+
+class ScoringTests(Fixture):
+    def test_no_evidence_keeps_the_hand_set_value(self):
+        self.assertIsNone(contact_sentiment.recompute(self.uma))
+        self.uma.refresh_from_db()
+        self.assertEqual((self.uma.sentiment, self.uma.sentiment_source), ("positive", "manual"))
+
+    def test_a_negative_call_yesterday_outweighs_an_old_positive_email(self):
+        self.call("negative", days_ago=1, participants=[self.sam])
+        Email.objects.create(
+            customer=self.pizza,
+            subject="Thanks!",
+            sender_name="Sam",
+            recipient_name="Carl",
+            body="great",
+            sent_at=NOW - timedelta(days=200),
+            from_address="sam@pizzahut.com",
+            sentiment="positive",
+            ai_classified_at=NOW,
+        )
+        self.assertEqual(contact_sentiment.recompute(self.sam), "negative")
+        self.sam.refresh_from_db()
+        self.assertEqual(self.sam.sentiment_source, "computed")
+        evidence = self.sam.sentiment_evidence
+        self.assertEqual((evidence["calls"], evidence["emails"], evidence["tickets"]), (1, 1, 0))
+        self.assertEqual((evidence["positive"], evidence["negative"]), (1, 1))
+        self.assertLess(evidence["score"], -0.25)
+        self.assertEqual(self.sam.last_contacted_at, NOW - timedelta(days=1))
+
+    def test_mixed_recent_evidence_is_neutral_and_tickets_count(self):
+        self.call("positive", participants=[self.sam])
+        Ticket.objects.create(
+            customer=self.pizza,
+            ticket_number="ZD-1",
+            title="Broken",
+            priority="high",
+            opened_at=date.today(),
+            requester_email="Sam@PizzaHut.com",
+            sentiment="negative",
+            ai_classified_at=NOW,
+        )
+        self.assertEqual(contact_sentiment.recompute(self.sam), "neutral")
+        self.sam.refresh_from_db()
+        self.assertEqual(self.sam.sentiment_evidence["tickets"], 1)
+
+    def test_unclassified_records_are_not_evidence(self):
+        Call.objects.create(
+            customer=self.pizza, title="x", host_name="h", occurred_at=NOW, sentiment="negative"
+        ).participants.set([self.sam])
+        self.assertIsNone(contact_sentiment.recompute(self.sam))
+
+    def test_evidence_that_disappears_returns_the_contact_to_hand_set(self):
+        call = self.call("negative", participants=[self.sam])
+        contact_sentiment.recompute(self.sam)
+        call.delete()
+        contact_sentiment.recompute(self.sam)
+        self.sam.refresh_from_db()
+        self.assertEqual((self.sam.sentiment_source, self.sam.sentiment_evidence), ("manual", {}))
+
+    def test_recompute_all_touches_every_contact_in_the_organisation(self):
+        self.call("positive", participants=[self.sam])
+        other = Organisation.objects.create(name="Other")
+        theirs = Customer.objects.create(organisation=other, name="Theirs")
+        Contact.objects.create(customer=theirs, name="Ann Other", email="ann@theirs.com")
+        self.assertEqual(contact_sentiment.recompute_all(self.org), 1)
+
+    def test_classification_of_a_call_updates_its_participants(self):
+        from services.customers.classification import classify_records
+
+        call = Call.objects.create(
+            customer=self.pizza, title="Escalation", host_name="Carl", occurred_at=NOW
+        )
+        call.participants.set([self.sam])
+        with patch(
+            "services.customers.classification.classify_batch",
+            return_value={
+                f"call:{call.id}": {
+                    "sentiment": "negative",
+                    "ai_area": "",
+                    "ai_category": "",
+                    "ai_subcategory": "",
+                }
+            },
+        ):
+            classify_records([call], organisation=self.org)
+        self.sam.refresh_from_db()
+        self.assertEqual((self.sam.sentiment, self.sam.sentiment_source), ("negative", "computed"))
+
+    def test_the_maintenance_job_recomputes_contacts(self):
+        self.call("negative", participants=[self.sam])
+        call_command("run_health_maintenance", org_email="carl@acme.io")
+        self.sam.refresh_from_db()
+        self.assertEqual(self.sam.sentiment, "negative")
+
+
+class ParticipantTests(Fixture):
+    def test_transcript_names_and_addresses_match_this_companys_contacts(self):
+        text = "Carl: hi all. SAM PIZZA: we are unhappy. uma@pizzahut.co.uk joined late."
+        matched = contact_sentiment.match_participants(self.pizza, None, text, viewer=self.carl)
+        self.assertEqual({c.id for c in matched}, {self.sam.id, self.uma.id})
+        self.assertEqual(
+            contact_sentiment.match_participants(self.pizza, None, "nobody here", viewer=self.carl),
+            [],
+        )
+
+    def test_logging_a_call_links_chosen_and_named_participants(self):
+        self.client.force_authenticate(self.carl)
+        outsider_org = Organisation.objects.create(name="Other")
+        outsider_customer = Customer.objects.create(organisation=outsider_org, name="Theirs")
+        outsider = Contact.objects.create(
+            customer=outsider_customer, name="Ann Other", email="ann@theirs.com"
+        )
+        response = self.client.post(
+            f"/api/v1/customers/{self.pizza.id}/calls/",
+            {
+                "title": "QBR",
+                "occurred_at": NOW.isoformat(),
+                "summary": "Fine.",
+                "participant_ids": [self.uma.id, outsider.id],
+                "transcript_text": "Sam Pizza asked for SSO.",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        names = sorted(p["name"] for p in response.data["participants"])
+        self.assertEqual(names, ["Sam Pizza", "Uma Hut"])  # the outsider is dropped
+        self.assertEqual(response.data["participants"][0]["role_display"], "Other")
+        self.sam.refresh_from_db()
+        self.assertEqual(self.sam.last_contacted_at.date(), NOW.date())
+
+
+class ContactApiTests(Fixture):
+    def test_the_contact_carries_its_source_and_call_count(self):
+        self.call("positive", participants=[self.sam], title="Renewal chat")
+        contact_sentiment.recompute(self.sam)
+        self.client.force_authenticate(self.carl)
+        row = self.client.get(f"/api/v1/contacts/{self.sam.id}/").data
+        self.assertEqual((row["sentiment"], row["sentiment_source"]), ("positive", "computed"))
+        self.assertEqual(row["calls"], 1)
+        self.assertNotIn("sentiment_evidence", row)
+        self.assertIsNotNone(row["sentiment_computed_at"])
+
+    def test_a_hand_edit_marks_the_sentiment_manual_until_evidence_returns(self):
+        self.call("positive", participants=[self.sam])
+        contact_sentiment.recompute(self.sam)
+        self.client.force_authenticate(self.carl)
+        response = self.client.patch(
+            f"/api/v1/contacts/{self.sam.id}/", {"sentiment": "negative"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            (response.data["sentiment"], response.data["sentiment_source"]), ("negative", "manual")
+        )
+        self.assertEqual(contact_sentiment.recompute(self.sam), "positive")
+
+    def test_the_retired_interactions_endpoint_is_gone(self):
+        self.client.force_authenticate(self.carl)
+        self.assertEqual(
+            self.client.get(f"/api/v1/contacts/{self.sam.id}/interactions/").status_code, 404
+        )
+
+
+__all__ = ["datetime", "dt_timezone"]
+
+
+class ParticipantVisibilityTests(Fixture):
+    """Logging a call attaches only contacts the logger may see: the
+    organisation's own, and those on accounts they may open."""
+
+    def setUp(self):
+        from services.customers.tests.test_views import blind_to_one_account
+
+        super().setUp()
+        self.viewer, self.seen, self.hidden = blind_to_one_account(self.pizza)
+        self.seen_contact = Contact.objects.create(
+            account=self.seen, name="Sue Seen", email="sue@pizzahut.com"
+        )
+        self.hidden_contact = Contact.objects.create(
+            account=self.hidden, name="Hal Hidden", email="hal@pizzahut.com"
+        )
+
+    def test_a_hidden_accounts_contact_named_in_the_transcript_is_not_attached(self):
+        self.client.force_authenticate(self.viewer)
+        response = self.client.post(
+            f"/api/v1/customers/{self.pizza.id}/calls/",
+            {
+                "title": "QBR",
+                "occurred_at": NOW.isoformat(),
+                "summary": "Fine.",
+                "participant_ids": [self.hidden_contact.id],
+                "transcript_text": "Sam Pizza, Sue Seen and Hal Hidden joined.",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        names = sorted(p["name"] for p in response.data["participants"])
+        self.assertEqual(names, ["Sam Pizza", "Sue Seen"])
+
+    def test_a_viewer_who_sees_everything_matches_every_account(self):
+        admin = User.objects.create_user(
+            email="admin@acme.io",
+            password="x",
+            name="Admin",
+            organisation=self.org,
+            role=User.Role.ADMIN,
+        )
+        matched = contact_sentiment.match_participants(
+            self.pizza, None, "Sue Seen and Hal Hidden", viewer=admin
+        )
+        self.assertEqual({c.id for c in matched}, {self.seen_contact.id, self.hidden_contact.id})
+        matched = contact_sentiment.match_participants(
+            self.pizza, None, "Sue Seen and Hal Hidden", viewer=self.viewer
+        )
+        self.assertEqual({c.id for c in matched}, {self.seen_contact.id})
+
+
+class EvidenceScopeTests(Fixture):
+    """What a contact's sentiment rests on: their own tenant's records, and
+    only calls that said something."""
+
+    def test_a_not_analysable_call_is_not_evidence(self):
+        from services.customers.classification import mark_not_analysable
+
+        call = self.call("negative", participants=[self.sam])
+        mark_not_analysable(call)
+        self.assertIsNone(contact_sentiment.recompute(self.sam))
+        self.sam.refresh_from_db()
+        # Being on it is still contact.
+        self.assertEqual(self.sam.last_contacted_at, call.occurred_at)
+
+    def test_another_tenants_mail_from_the_same_address_is_not_evidence(self):
+        other = Organisation.objects.create(name="Other")
+        theirs = Customer.objects.create(organisation=other, name="Theirs")
+        Email.objects.create(
+            customer=theirs,
+            subject="Furious",
+            sender_name="Sam",
+            recipient_name="Them",
+            body="angry",
+            sent_at=NOW,
+            from_address="sam@pizzahut.com",
+            sentiment="negative",
+            ai_classified_at=NOW,
+        )
+        Ticket.objects.create(
+            customer=theirs,
+            ticket_number="ZD-9",
+            title="Broken",
+            priority="high",
+            opened_at=date.today(),
+            requester_email="sam@pizzahut.com",
+            sentiment="negative",
+            ai_classified_at=NOW,
+        )
+        self.assertIsNone(contact_sentiment.recompute(self.sam))
+
+    def test_an_account_contacts_mail_on_their_own_tenant_counts(self):
+        Email.objects.create(
+            account=self.hut_uk,
+            subject="Thanks",
+            sender_name="Uma",
+            recipient_name="Carl",
+            body="great",
+            sent_at=NOW,
+            from_address="uma@pizzahut.co.uk",
+            sentiment="positive",
+            ai_classified_at=NOW,
+        )
+        self.assertEqual(contact_sentiment.recompute(self.uma), "positive")
+
+
+class ContactsForRecordsTests(Fixture):
+    """Who a batch of records bears on: found in a fixed number of queries,
+    and only inside each record's own tenant."""
+
+    def test_an_address_matches_only_inside_the_records_own_tenant(self):
+        other = Organisation.objects.create(name="Other")
+        theirs = Customer.objects.create(organisation=other, name="Theirs")
+        stranger = Contact.objects.create(customer=theirs, name="Uma", email="uma@pizzahut.co.uk")
+        email = Email.objects.create(
+            account=self.hut_uk,
+            subject="Thanks",
+            sender_name="Uma",
+            recipient_name="Carl",
+            body="great",
+            sent_at=NOW,
+            from_address="Uma@PizzaHut.co.uk",
+        )
+        ticket = Ticket.objects.create(
+            account=self.hut_uk,
+            ticket_number="ZD-1",
+            title="Broken",
+            priority="high",
+            opened_at=date.today(),
+            requester_email="uma@pizzahut.co.uk",
+        )
+        found = set(contact_sentiment.contacts_for_records([email, ticket]))
+        self.assertEqual(found, {self.uma})
+        self.assertNotIn(stranger, found)
+
+    def test_the_lookup_does_not_grow_with_the_records(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def queries(n):
+            records = [self.call("positive", participants=[self.sam]) for _ in range(n)]
+            records += [
+                Email.objects.create(
+                    customer=self.pizza,
+                    subject="Hi",
+                    sender_name="Sam",
+                    recipient_name="Carl",
+                    body="hi",
+                    sent_at=NOW,
+                    from_address="sam@pizzahut.com",
+                )
+                for _ in range(n)
+            ]
+            records = [type(r).objects.get(pk=r.pk) for r in records]
+            with CaptureQueriesContext(connection) as ctx:
+                found = list(contact_sentiment.contacts_for_records(records))
+                for contact in found:
+                    contact_sentiment.organisation_id_of(contact)
+            return len(ctx.captured_queries)
+
+        self.assertEqual(queries(1), queries(4))
+
+    def test_recompute_all_reads_each_contacts_tenant_without_a_query_each(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def queries():
+            with (
+                patch.object(contact_sentiment, "recompute", return_value=None) as recompute,
+                CaptureQueriesContext(connection) as ctx,
+            ):
+                contact_sentiment.recompute_all(self.org)
+                for call in recompute.call_args_list:
+                    contact_sentiment.organisation_id_of(call.args[0])
+            return len(ctx.captured_queries)
+
+        before = queries()
+        for n in range(3):
+            Contact.objects.create(account=self.hut_uk, name=f"More {n}", email=f"m{n}@hut.co.uk")
+        self.assertEqual(queries(), before)

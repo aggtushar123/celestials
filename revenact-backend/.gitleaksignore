@@ -1,0 +1,7 @@
+# Findings that are deliberately not secrets (SOC2:SEC-01). One fingerprint per
+# line, each with the reason above it.
+
+# The dummy test password "pw-123456789" quoted from
+# services/accounts/tests/test_digest_opt_out.py (tests/ is allowlisted in
+# .gitleaks.toml) inside the Work delivery 3 plan.
+f0982f38b42f8e89a2469faef33f2c41135a3a96:docs/superpowers/plans/2026-10-08-work-tracking-backend.md:generic-api-key:1398

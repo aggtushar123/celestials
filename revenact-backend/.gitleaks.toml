@@ -1,0 +1,21 @@
+# gitleaks configuration (SOC2:SEC-01). Default rules plus allowlists for the
+# values that are deliberately not secrets.
+title = "revenact-backend"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secrets: the local/CI Postgres URL, test fixtures, the bundled skill"
+regexes = [
+  '''postgres://revenact:revenact@(localhost|db|postgres):5432/revenact''',  # soc2:ignore allowlist pattern, dev-only db
+  '''django-insecure-dev-key-change-in-production''',
+  # The dummy test password used across the test suites and quoted in plan
+  # docs; allowlisted by value so a moved line or a tree-only scan (Cloud
+  # Build without .git) still matches. Never a real credential.
+  '''pw-123456789''',
+]
+paths = [
+  '''^\.claude/''',
+  '''(^|/)tests/''',
+]

@@ -1,0 +1,317 @@
+/* ─────────────────────────────────────────────────────────────
+   Auth surfaces: sign-in, provider callback, forgot and reset.
+
+   These are the only pages a stranger sees, so they run on the house
+   tokens from src/index.css and nothing else. Every colour below is a
+   var(); there is no literal hex in this file and no font request (the
+   document's own stack applies, as it does everywhere else).
+
+   One layout serves all four pages: a single centred card. Split-panel
+   art was dropped so a failed sign-in, a pending approval and a reset
+   link all resolve to the same shape.
+───────────────────────────────────────────────────────────── */
+
+.auth-page {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  /* The same canvas the signed-in shell uses, so the first screen and the
+     rest of the product are visibly one thing. */
+  background-color: var(--bg-base);
+  background-image:
+    radial-gradient(circle at 4% 96%, var(--rv-canvas-gradient-1) 0%, transparent 44%),
+    radial-gradient(circle at 96% 45%, var(--rv-canvas-gradient-2) 0%, transparent 45%);
+  background-attachment: fixed;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 32px 28px;
+  border: 1px solid var(--border-default);
+  border-radius: 18px;
+  background: var(--bg-surface);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.05);
+}
+
+/* ── Provider buttons ──────────────────────────────────────── */
+
+.auth-provider-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid var(--border-default);
+  border-radius: 9999px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+.auth-provider-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+
+.auth-provider-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.auth-provider-btn:active:not(:disabled) {
+  background: var(--bg-subtle);
+}
+
+.auth-provider-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Matches the button's own height so nothing shifts when the real
+   buttons arrive. */
+.auth-provider-skeleton {
+  height: 44px;
+  border-radius: 9999px;
+  background: var(--bg-subtle);
+  animation: auth-pulse 1.4s var(--ease-out) infinite;
+}
+
+@keyframes auth-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* ── Inputs ────────────────────────────────────────────────── */
+
+.auth-input,
+.form-input {
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 13px;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.auth-input::placeholder,
+.form-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+.auth-input:focus,
+.form-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.form-input.has-error {
+  border-color: var(--danger);
+}
+
+/* ── Primary action ────────────────────────────────────────── */
+
+.auth-submit-btn,
+.login-btn-primary {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 11px 16px;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.auth-submit-btn:hover:not(:disabled),
+.login-btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.auth-submit-btn:focus-visible,
+.login-btn-primary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.auth-submit-btn:disabled,
+.login-btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ── Shared pieces still used by forgot / reset ────────────── */
+
+.login-form-wrapper {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.login-form-wrapper h2 {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.auth-subtext {
+  margin: 0 0 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.auth-subtext strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.form-group {
+  margin-bottom: 16px;
+  text-align: left;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.form-input-wrapper {
+  position: relative;
+}
+
+.password-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.password-header label {
+  margin-bottom: 0;
+}
+
+.show-password-btn,
+.back-to-login,
+.forgot-password {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.show-password-btn:hover,
+.back-to-login:hover,
+.forgot-password:hover {
+  color: var(--text-primary);
+}
+
+.back-to-login {
+  margin-top: 18px;
+  align-self: center;
+}
+
+.field-error {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.server-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  background: var(--danger-dim);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--danger);
+}
+
+.login-btn {
+  width: 100%;
+}
+
+.auth-link-btn {
+  text-align: center;
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid color-mix(in srgb, var(--on-accent) 35%, transparent);
+  border-top-color: var(--on-accent);
+  border-radius: 50%;
+  animation: auth-spin 700ms linear infinite;
+}
+
+@keyframes auth-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Reduced motion ────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-provider-skeleton,
+  .spinner {
+    animation: none;
+  }
+}
+
+/* ── Narrow viewports ──────────────────────────────────────── */
+
+@media (max-width: 480px) {
+  .auth-card {
+    padding: 28px 20px;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+  }
+}

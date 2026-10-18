@@ -1,0 +1,59 @@
+# Cloud Build: every push to main builds the backend image, pushes it to
+# Artifact Registry, then hands its digest to the public deploy repo
+# (aggtushar123/revenact-deploy), whose workflow migrates and rolls it out to
+# Cloud Run. The trigger runs as cloudbuild-builder@revenact-prod; the GitHub
+# token that sends the hand-off is the Secret Manager secret
+# github-dispatch-token (a fine-grained PAT scoped to that one repo).
+# The same image runs the web sidecar, the worker and the jobs.
+substitutions:
+  _IMAGE: asia-south1-docker.pkg.dev/revenact-prod/revenact/backend
+
+steps:
+  - id: pull-cache
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: ["-c", "docker pull ${_IMAGE}:latest || true"]
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env: ["DOCKER_BUILDKIT=1"]
+    args:
+      - build
+      - --build-arg=BUILDKIT_INLINE_CACHE=1
+      - --cache-from=${_IMAGE}:latest
+      - --tag=${_IMAGE}:${SHORT_SHA}
+      - --tag=${_IMAGE}:latest
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "--all-tags", "${_IMAGE}"]
+
+  - id: hand-off
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    secretEnv: ["GITHUB_TOKEN"]
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        digest=$$(gcloud artifacts docker images describe "${_IMAGE}:${SHORT_SHA}" \
+          --format='value(image_summary.digest)')
+        echo "pushed ${_IMAGE}@$${digest}"
+        curl -fsS -X POST \
+          -H "Authorization: Bearer $${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/aggtushar123/revenact-deploy/dispatches \
+          -d "{\"event_type\":\"image-built\",\"client_payload\":{\"component\":\"backend\",\"image\":\"${_IMAGE}@$${digest}\",\"commit\":\"${COMMIT_SHA}\"}}"
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/revenact-prod/secrets/github-dispatch-token/versions/latest
+      env: GITHUB_TOKEN
+
+options:
+  # Required when a build runs as a user-specified service account.
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: 1800s

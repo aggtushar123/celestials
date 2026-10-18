@@ -1,0 +1,54 @@
+{
+  "id": "18c2f0a9e1b2c3d4",
+  "threadId": "18c2f0a9e1b2c3d4",
+  "labelIds": ["INBOX", "UNREAD", "IMPORTANT", "Label_12"],
+  "snippet": "Hi Dana, The renewal quote is attached. Ann",
+  "historyId": "9876001",
+  "internalDate": "1791536400000",
+  "sizeEstimate": 245011,
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      {"name": "From", "value": "Ann Lee <ann@pizzahut.com>"},
+      {"name": "To", "value": "Dana Ruiz <dana@acme.io>"},
+      {"name": "Cc", "value": "Sam Pizza <sam@pizzahut.com>"},
+      {"name": "Subject", "value": "Renewal quote"},
+      {"name": "Message-ID", "value": "<CAF=quote@mail.gmail.com>"},
+      {"name": "References", "value": "<CAF=first@mail.gmail.com>"},
+      {"name": "Date", "value": "Fri, 9 Oct 2026 09:00:00 +0000"}
+    ],
+    "body": {"size": 0},
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "multipart/alternative",
+        "filename": "",
+        "headers": [],
+        "body": {"size": 0},
+        "parts": [
+          {"partId": "0.0", "mimeType": "text/plain", "filename": "", "headers": [], "body": {"size": 51, "data": "SGkgRGFuYSwNCg0KVGhlIHJlbmV3YWwgcXVvdGUgaXMgYXR0YWNoZWQuDQoNCkFubg0K"}},
+          {"partId": "0.1", "mimeType": "text/html", "filename": "", "headers": [], "body": {"size": 157, "data": "PGRpdiBzdHlsZT0iZm9udC1mYW1pbHk6QXJpYWwiPjxwPkhpIERhbmEsPC9wPjxwPlRoZSByZW5ld2FsIHF1b3RlIGlzIGF0dGFjaGVkLjwvcD48aW1nIHNyYz0iY2lkOmxvZ29AcGl6emFodXQuY29tIj48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ-PHA-QW5uPC9wPjwvZGl2Pg"}}
+        ]
+      },
+      {
+        "partId": "1",
+        "mimeType": "application/pdf",
+        "filename": "Renewal quote.pdf",
+        "headers": [{"name": "Content-Disposition", "value": "attachment; filename=\"Renewal quote.pdf\""}],
+        "body": {"attachmentId": "ANGjdJ8quote", "size": 182311}
+      },
+      {
+        "partId": "2",
+        "mimeType": "image/png",
+        "filename": "logo.png",
+        "headers": [
+          {"name": "Content-Disposition", "value": "inline; filename=\"logo.png\""},
+          {"name": "Content-ID", "value": "<logo@pizzahut.com>"}
+        ],
+        "body": {"attachmentId": "ANGjdJ8logo", "size": 4210}
+      }
+    ]
+  }
+}

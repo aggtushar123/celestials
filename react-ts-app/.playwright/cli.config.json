@@ -1,0 +1,7 @@
+{
+  "browser": {
+    "contextOptions": { "viewport": { "width": 1280, "height": 720 } }
+  },
+  "testIdAttribute": "data-testid",
+  "outputDir": ".playwright-cli"
+}

@@ -1,0 +1,540 @@
+"""The internal portal.
+
+Defended: only a superuser with the `mfa` claim gets in (a tenant admin never
+does, an unenrolled superuser is told to enrol); the detail payload carries
+metadata and nothing from inside a tenant; suspension closes every door and
+reactivation opens them; staff can move ownership when the owner cannot; every
+action lands in the tenant's own audit trail.
+"""
+
+from django.db import connection as db
+from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+from rest_framework import status
+from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import AccessToken
+
+from core.models import AuditEvent
+from services.accounts import mfa
+from services.accounts.models import Organisation, User
+from services.identity import ownership
+from services.identity.models import AccessRequest, OrganizationDomain, OrganizationMembership
+from services.mail.tests.gmail_fixtures import google_connection
+
+#: Everything the detail endpoint may return. A new key here is a review
+#: question: is it metadata, or is it something a tenant considers theirs?
+DETAIL_KEYS = {
+    "id",
+    "name",
+    "slug",
+    "status",
+    "created_at",
+    "owner",
+    "members_active",
+    "pending_requests",
+    "domains",
+    "plan",
+    "gmail",
+    "open_invitations",
+    "memberships",
+    "recent_events",
+}
+
+
+def mfa_token_for(user):
+    token = AccessToken.for_user(user)
+    token["mfa"] = True
+    return str(token)
+
+
+class PlatformTestCase(APITestCase):
+    def setUp(self):
+        self.acme = Organisation.objects.create(name="Acme Inc")
+        self.rival = Organisation.objects.create(name="Rival Ltd")
+        self.owner = User.objects.create_user(
+            email="owner@acme.io",
+            password="x",
+            name="Owner",
+            organisation=self.acme,
+            role=User.Role.ADMIN,
+        )
+        ownership.claim(self.owner, self.acme)
+        self.csm = User.objects.create_user(
+            email="csm@acme.io", password="supersecret-pw-1", name="CSM", organisation=self.acme
+        )
+        OrganizationDomain.objects.create(
+            organisation=self.acme, domain="acme.io", verification_status="verified"
+        )
+        self.staff = User.objects.create_superuser(
+            email="staff@revenact.io", password="supersecret-pw-1", name="Staff"
+        )
+
+    def as_staff(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {mfa_token_for(self.staff)}")
+
+
+class AccessTests(PlatformTestCase):
+    def test_a_tenant_admin_is_refused_even_with_a_second_factor(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {mfa_token_for(self.owner)}")
+        response = self.client.get("/api/v1/platform/organisations/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_a_superuser_without_the_second_factor_is_told_to_enrol(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(self.staff)}")
+        response = self.client.get("/api/v1/platform/organisations/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data["detail"], "MFA_REQUIRED")
+
+    def test_the_real_login_flow_reaches_the_portal(self):
+        """End to end: password, then code, then the portal answers."""
+        _, secret = mfa.begin_enrolment(self.staff)
+        mfa.confirm_enrolment(self.staff, mfa._code_at(secret, mfa.current_counter()))
+        first = self.client.post(
+            "/api/v1/auth/login/", {"email": "staff@revenact.io", "password": "supersecret-pw-1"}
+        )
+        import time
+        from unittest.mock import patch
+
+        later = time.time() + 60
+        with patch("services.accounts.mfa.time.time", return_value=later):
+            second = self.client.post(
+                "/api/v1/auth/login/mfa/",
+                {
+                    "mfa_token": first.data["mfa_token"],
+                    "code": mfa._code_at(secret, mfa.current_counter(later)),
+                },
+            )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {second.data['access']}")
+        self.assertEqual(
+            self.client.get("/api/v1/platform/overview/").status_code, status.HTTP_200_OK
+        )
+
+    def test_anonymous_is_refused(self):
+        self.assertEqual(
+            self.client.get("/api/v1/platform/overview/").status_code, status.HTTP_401_UNAUTHORIZED
+        )
+
+
+class ReadTests(PlatformTestCase):
+    def test_overview_counts(self):
+        self.as_staff()
+        response = self.client.get("/api/v1/platform/overview/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["organisations"]["total"], 2)
+        self.assertEqual(response.data["organisations"]["active"], 2)
+        self.assertEqual(response.data["members_active"], 2)
+        self.assertEqual(response.data["verified_domains"], 1)
+        self.assertEqual(response.data["staff"], 1)
+
+    def test_list_filters_and_searches_by_name_or_domain(self):
+        self.as_staff()
+        everything = self.client.get("/api/v1/platform/organisations/").data
+        self.assertEqual([o["name"] for o in everything], ["Acme Inc", "Rival Ltd"])
+        acme = next(o for o in everything if o["name"] == "Acme Inc")
+        self.assertEqual(acme["owner"]["email"], "owner@acme.io")
+        self.assertEqual(acme["members_active"], 2)
+        self.assertEqual(acme["domains"][0]["domain"], "acme.io")
+
+        by_domain = self.client.get("/api/v1/platform/organisations/", {"q": "acme.io"}).data
+        self.assertEqual([o["name"] for o in by_domain], ["Acme Inc"])
+
+        Organisation.objects.filter(pk=self.rival.pk).update(status="suspended")
+        suspended = self.client.get("/api/v1/platform/organisations/", {"status": "suspended"}).data
+        self.assertEqual([o["name"] for o in suspended], ["Rival Ltd"])
+
+    def test_detail_is_metadata_only(self):
+        """The property that makes a 'manage everyone' surface safe to have."""
+        self.as_staff()
+        response = self.client.get(f"/api/v1/platform/organisations/{self.acme.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(set(response.data), DETAIL_KEYS)
+        for forbidden in ("customers", "emails", "notes", "tickets", "calls", "attachments"):
+            self.assertNotIn(forbidden, str(response.data).lower())
+
+        members = response.data["memberships"]
+        self.assertEqual(members[0]["email"], "owner@acme.io", "owner first")
+        self.assertTrue(members[0]["is_owner"])
+        self.assertEqual({m["email"] for m in members}, {"owner@acme.io", "csm@acme.io"})
+
+    def test_an_unknown_organisation_is_404(self):
+        self.as_staff()
+        self.assertEqual(
+            self.client.get("/api/v1/platform/organisations/999999/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_staff_list_shows_second_factor_state(self):
+        self.as_staff()
+        rows = self.client.get("/api/v1/platform/staff/").data
+        self.assertEqual([r["email"] for r in rows], ["staff@revenact.io"])
+        self.assertFalse(rows[0]["mfa_enrolled"])
+
+
+class SuspendTests(PlatformTestCase):
+    def test_suspension_closes_every_door_and_reactivation_opens_them(self):
+        self.as_staff()
+        response = self.client.post(
+            f"/api/v1/platform/organisations/{self.acme.id}/status/",
+            {"status": "suspended", "reason": "Non-payment"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Organisation.objects.get(pk=self.acme.pk).status, "suspended")
+
+        # Password sign-in is refused.
+        self.client.credentials()
+        login = self.client.post(
+            "/api/v1/auth/login/", {"email": "csm@acme.io", "password": "supersecret-pw-1"}
+        )
+        self.assertEqual(login.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("not active", str(login.data))
+
+        # An existing session holds nothing.
+        from services.identity.context import capabilities_for
+
+        self.assertEqual(capabilities_for(User.objects.get(pk=self.owner.pk)), [])
+
+        # It is on the tenant's own record.
+        event = AuditEvent.objects.get(action="platform.organisation.status")
+        self.assertEqual(event.organisation, self.acme)
+        self.assertEqual(event.actor, self.staff)
+        self.assertEqual(event.metadata["reason"], "Non-payment")
+
+        self.as_staff()
+        self.client.post(
+            f"/api/v1/platform/organisations/{self.acme.id}/status/",
+            {"status": "active", "reason": "Paid"},
+            format="json",
+        )
+        self.client.credentials()
+        login = self.client.post(
+            "/api/v1/auth/login/", {"email": "csm@acme.io", "password": "supersecret-pw-1"}
+        )
+        self.assertEqual(login.status_code, status.HTTP_200_OK)
+
+    def test_a_reason_is_required_and_status_is_bounded(self):
+        self.as_staff()
+        no_reason = self.client.post(
+            f"/api/v1/platform/organisations/{self.acme.id}/status/",
+            {"status": "suspended"},
+            format="json",
+        )
+        self.assertEqual(no_reason.data["error"]["code"], "REASON_REQUIRED")
+        bad = self.client.post(
+            f"/api/v1/platform/organisations/{self.acme.id}/status/",
+            {"status": "deleted", "reason": "x"},
+            format="json",
+        )
+        self.assertEqual(bad.data["error"]["code"], "INVALID_STATUS")
+        self.assertEqual(Organisation.objects.get(pk=self.acme.pk).status, "active")
+
+
+class OwnerTests(PlatformTestCase):
+    def test_staff_can_move_ownership_when_the_owner_cannot(self):
+        User.objects.filter(pk=self.owner.pk).update(is_active=False)
+        self.as_staff()
+        response = self.client.post(
+            f"/api/v1/platform/organisations/{self.acme.id}/owner/",
+            {"user_id": self.csm.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["owner"]["email"], "csm@acme.io")
+        self.assertTrue(ownership.is_owner(User.objects.get(pk=self.csm.pk)))
+        self.assertEqual(User.objects.get(pk=self.csm.pk).role.slug, "admin")
+        event = AuditEvent.objects.get(action="organisation.owner_transferred")
+        self.assertTrue(event.metadata["by_platform"])
+        self.assertEqual(event.actor, self.staff)
+
+    def test_ownership_cannot_be_given_to_someone_outside(self):
+        self.as_staff()
+        outsider = User.objects.create_user(
+            email="x@rival.io", password="x", name="X", organisation=self.rival
+        )
+        response = self.client.post(
+            f"/api/v1/platform/organisations/{self.acme.id}/owner/",
+            {"user_id": outsider.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error"]["code"], "NOT_A_MEMBER")
+        self.assertTrue(ownership.is_owner(self.owner))
+
+    def test_pending_people_are_counted_not_listed_as_members(self):
+        waiting = User.objects.create_user(email="w@acme.io", password="x", name="W")
+        AccessRequest.objects.create(organisation=self.acme, user=waiting, email="w@acme.io")
+        self.as_staff()
+        detail = self.client.get(f"/api/v1/platform/organisations/{self.acme.id}/").data
+        self.assertEqual(detail["pending_requests"], 1)
+        self.assertNotIn("w@acme.io", {m["email"] for m in detail["memberships"]})
+        self.assertEqual(OrganizationMembership.objects.filter(user=waiting).count(), 0)
+
+
+class CrudTests(PlatformTestCase):
+    def test_creating_an_organisation_creates_its_root_user(self):
+        """The owner is the root user: Admin, owner, no password, active
+        membership, in the same transaction as the tenant."""
+        self.as_staff()
+        response = self.client.post(
+            "/api/v1/platform/organisations/",
+            {"name": "Newco", "owner_email": "Priya@Newco.io", "owner_name": "Priya"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["owner"]["email"], "priya@newco.io")
+        self.assertEqual(response.data["members_active"], 1)
+
+        owner = User.objects.get(email="priya@newco.io")
+        self.assertEqual(owner.organisation.name, "Newco")
+        self.assertEqual(owner.role.slug, "admin")
+        self.assertTrue(ownership.is_owner(owner))
+        self.assertFalse(owner.has_usable_password())
+        self.assertEqual(OrganizationMembership.objects.get(user=owner).status, "active")
+        event = AuditEvent.objects.get(action="platform.organisation.created")
+        self.assertEqual(event.actor, self.staff)
+        self.assertEqual(event.metadata["owner"], "priya@newco.io")
+
+    def test_an_address_already_in_use_cannot_own_a_second_tenant(self):
+        self.as_staff()
+        response = self.client.post(
+            "/api/v1/platform/organisations/",
+            {"name": "Again", "owner_email": "csm@acme.io"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error"]["code"], "EMAIL_TAKEN")
+        self.assertFalse(Organisation.objects.filter(name="Again").exists())
+
+    def test_name_and_email_are_required(self):
+        self.as_staff()
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/platform/organisations/", {"owner_email": "a@b.io"}, format="json"
+            ).data["error"]["code"],
+            "INVALID_NAME",
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/platform/organisations/",
+                {"name": "X", "owner_email": "nope"},
+                format="json",
+            ).data["error"]["code"],
+            "INVALID_EMAIL",
+        )
+
+    def test_rename(self):
+        self.as_staff()
+        response = self.client.patch(
+            f"/api/v1/platform/organisations/{self.acme.id}/",
+            {"name": "Acme Corporation"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Organisation.objects.get(pk=self.acme.pk).name, "Acme Corporation")
+        self.assertTrue(AuditEvent.objects.filter(action="platform.organisation.updated").exists())
+
+    def test_delete_archives_and_keeps_everything(self):
+        self.as_staff()
+        response = self.client.delete(
+            f"/api/v1/platform/organisations/{self.acme.id}/", {"reason": "Churned"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Organisation.objects.get(pk=self.acme.pk).status, "archived")
+        self.assertTrue(User.objects.filter(email="owner@acme.io").exists(), "nothing purged")
+
+        # Out of the default list, back with the filter, and closed to sign-in.
+        names = [o["name"] for o in self.client.get("/api/v1/platform/organisations/").data]
+        self.assertNotIn("Acme Inc", names)
+        archived = self.client.get("/api/v1/platform/organisations/", {"status": "archived"}).data
+        self.assertEqual([o["name"] for o in archived], ["Acme Inc"])
+        self.client.credentials()
+        login = self.client.post(
+            "/api/v1/auth/login/", {"email": "csm@acme.io", "password": "supersecret-pw-1"}
+        )
+        self.assertEqual(login.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_delete_needs_a_reason(self):
+        self.as_staff()
+        response = self.client.delete(
+            f"/api/v1/platform/organisations/{self.acme.id}/", {}, format="json"
+        )
+        self.assertEqual(response.data["error"]["code"], "REASON_REQUIRED")
+        self.assertEqual(Organisation.objects.get(pk=self.acme.pk).status, "active")
+
+
+@override_settings(GMAIL_TEST_USER_CAP=100)
+class GmailSwitchTests(PlatformTestCase):
+    """The pilot approval: staff switch two-way Gmail on per workspace, with
+    a reason, on the tenant's own trail; the portal counts the Google test-user
+    slots in use, never a mailbox's contents."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = f"/api/v1/platform/organisations/{self.acme.id}/gmail/"
+
+    def post(self, body, url=None):
+        return self.client.post(url or self.url, body, format="json")
+
+    def test_staff_switch_it_on_with_a_reason_on_the_tenants_trail(self):
+        self.as_staff()
+        response = self.post({"enabled": True, "reason": "Pilot approved"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data, {"gmail": {"enabled": True, "connected": 0, "paused": 0}})
+        self.acme.refresh_from_db()
+        self.assertTrue(self.acme.gmail_two_way_enabled)
+        event = AuditEvent.objects.get(action="platform.organisation.gmail_two_way")
+        self.assertEqual((event.organisation, event.actor), (self.acme, self.staff))
+        self.assertEqual(event.metadata, {"from": False, "to": True, "reason": "Pilot approved"})
+
+    def test_the_same_value_again_answers_and_writes_nothing(self):
+        self.as_staff()
+        response = self.post({"enabled": False, "reason": "Just checking"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            AuditEvent.objects.filter(action="platform.organisation.gmail_two_way").exists()
+        )
+
+    def test_enabled_must_be_a_boolean_and_a_reason_is_required(self):
+        self.as_staff()
+        for body, code in (
+            ({"enabled": "yes", "reason": "x"}, "INVALID_ENABLED"),
+            ({"reason": "x"}, "INVALID_ENABLED"),
+            ({"enabled": True, "reason": "  "}, "REASON_REQUIRED"),
+        ):
+            with self.subTest(body=body):
+                response = self.post(body)
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data["error"]["code"], code)
+        missing = self.post(
+            {"enabled": True, "reason": "x"}, "/api/v1/platform/organisations/999999/gmail/"
+        )
+        self.assertEqual(missing.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(missing.data["error"]["code"], "ORGANIZATION_NOT_FOUND")
+
+    def test_a_tenant_cannot_read_or_change_it(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {mfa_token_for(self.owner)}")
+        self.assertEqual(
+            self.post({"enabled": True, "reason": "x"}).status_code, status.HTTP_403_FORBIDDEN
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(self.owner)}")
+        response = self.client.patch(
+            "/api/v1/auth/organisation/", {"gmail_two_way_enabled": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("gmail_two_way_enabled", response.data)
+        self.acme.refresh_from_db()
+        self.assertFalse(self.acme.gmail_two_way_enabled)
+
+    def test_live_connections_and_pauses_are_counted_in_one_query(self):
+        Organisation.objects.filter(pk=self.acme.pk).update(gmail_two_way_enabled=True)
+        google_connection(self.owner)
+        google_connection(self.csm, paused_reason="no_seat")
+        gone = User.objects.create_user(
+            email="gone@acme.io", password="x", name="Gone", organisation=self.acme
+        )
+        # A disconnected mailbox no longer holds a Google test-user slot.
+        google_connection(gone, status="disconnected")
+        self.as_staff()
+        with CaptureQueriesContext(db) as queries:
+            rows = self.client.get("/api/v1/platform/organisations/").data
+        by_name = {o["name"]: o for o in rows}
+        self.assertEqual(
+            by_name["Acme Inc"]["gmail"], {"enabled": True, "connected": 2, "paused": 1}
+        )
+        self.assertEqual(
+            by_name["Rival Ltd"]["gmail"], {"enabled": False, "connected": 0, "paused": 0}
+        )
+        mail = [q for q in queries.captured_queries if "mail_mailboxconnection" in q["sql"]]
+        self.assertEqual(len(mail), 1)
+
+        detail = self.client.get(f"/api/v1/platform/organisations/{self.acme.id}/").data
+        self.assertEqual(detail["gmail"], {"enabled": True, "connected": 2, "paused": 1})
+        self.assertNotIn("mailbox", str(detail).lower())
+        overview = self.client.get("/api/v1/platform/overview/").data
+        self.assertEqual(
+            overview["gmail"], {"enabled_workspaces": 1, "connected": 2, "test_user_cap": 100}
+        )
+
+
+class DomainVerifyTests(PlatformTestCase):
+    """Staff verify a domain that cannot carry a DNS record (a Google-owned
+    onworkspace.com address, say): with a reason, on the tenant's own trail,
+    never a personal domain and never one another workspace proved in DNS."""
+
+    def setUp(self):
+        super().setUp()
+        self.domain = OrganizationDomain.objects.create(
+            organisation=self.rival, domain="rival.onworkspace.com", verification_token="tok"
+        )
+
+    def url(self, org=None, domain=None):
+        org_id = (org or self.rival).id
+        return (
+            f"/api/v1/platform/organisations/{org_id}/domains/{(domain or self.domain).id}/verify/"
+        )
+
+    def post(self, body, url=None):
+        return self.client.post(url or self.url(), body, format="json")
+
+    def test_staff_verify_it_with_a_reason_on_the_tenants_trail(self):
+        self.as_staff()
+        response = self.post({"reason": "Google Workspace owns DNS for onworkspace.com"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["verification_status"], "verified")
+        self.domain.refresh_from_db()
+        self.assertEqual(self.domain.verification_status, "verified")
+        self.assertIsNotNone(self.domain.verified_at)
+        event = AuditEvent.objects.get(action="platform.domain.verified")
+        self.assertEqual((event.organisation, event.actor), (self.rival, self.staff))
+        self.assertEqual(
+            event.metadata,
+            {
+                "domain": "rival.onworkspace.com",
+                "reason": "Google Workspace owns DNS for onworkspace.com",
+            },
+        )
+
+    def test_an_unproven_claim_elsewhere_is_superseded_and_audited(self):
+        squatter = OrganizationDomain.objects.create(
+            organisation=self.acme, domain="rival.onworkspace.com", verification_token="t2"
+        )
+        self.as_staff()
+        self.assertEqual(self.post({"reason": "x"}).status_code, status.HTTP_200_OK)
+        squatter.refresh_from_db()
+        self.assertEqual(squatter.verification_status, "revoked")
+        self.assertTrue(
+            AuditEvent.objects.filter(action="domain.superseded", organisation=self.acme).exists()
+        )
+
+    def test_already_verified_answers_and_writes_nothing(self):
+        self.domain.verification_status = "verified"
+        self.domain.save()
+        self.as_staff()
+        self.assertEqual(self.post({"reason": "x"}).status_code, status.HTTP_200_OK)
+        self.assertFalse(AuditEvent.objects.filter(action="platform.domain.verified").exists())
+
+    def test_refuses_a_personal_domain_and_one_proven_elsewhere(self):
+        gmail = OrganizationDomain.objects.create(organisation=self.rival, domain="gmail.com")
+        taken = OrganizationDomain.objects.create(organisation=self.rival, domain="acme.io")
+        self.as_staff()
+        for domain, code in ((gmail, "PERSONAL_DOMAIN"), (taken, "DOMAIN_VERIFIED_ELSEWHERE")):
+            with self.subTest(domain=domain.domain):
+                response = self.post({"reason": "x"}, self.url(domain=domain))
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data["error"]["code"], code)
+                domain.refresh_from_db()
+                self.assertEqual(domain.verification_status, "pending")
+
+    def test_a_reason_is_required_and_the_domain_must_be_the_workspaces(self):
+        self.as_staff()
+        response = self.post({"reason": " "})
+        self.assertEqual(response.data["error"]["code"], "REASON_REQUIRED")
+        wrong_org = self.post({"reason": "x"}, self.url(org=self.acme))
+        self.assertEqual(wrong_org.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(wrong_org.data["error"]["code"], "DOMAIN_NOT_FOUND")
+        self.domain.refresh_from_db()
+        self.assertEqual(self.domain.verification_status, "pending")
+
+    def test_a_tenant_admin_cannot_verify(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {mfa_token_for(self.owner)}")
+        self.assertEqual(self.post({"reason": "x"}).status_code, status.HTTP_403_FORBIDDEN)

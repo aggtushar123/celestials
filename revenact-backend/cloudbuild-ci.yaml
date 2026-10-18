@@ -1,0 +1,68 @@
+# CI on Cloud Build (GitHub Actions is billing-blocked): every pull request to
+# main runs what .github/workflows/ci.yml runs — ruff check, ruff format
+# --check, migrations and the whole suite on Postgres 16 — and the Cloud
+# Build GitHub app reports the result on the PR. One 32-core machine with
+# --parallel auto instead of four shards. Started by the `backend-pr` trigger
+# in revenact-deploy/terraform/cloudbuild.tf; no secrets, nothing pushed.
+steps:
+  # Postgres 16 with pgvector (production's version, Cloud SQL ships the
+  # extension) on Cloud Build's shared docker network;
+  # later steps reach it as host `pg`.
+  - id: postgres
+    name: gcr.io/cloud-builders/docker
+    args:
+      - run
+      - --detach
+      - --network=cloudbuild
+      - --name=pg
+      - --env=POSTGRES_USER=revenact
+      - --env=POSTGRES_PASSWORD=revenact
+      - --env=POSTGRES_DB=revenact
+      - pgvector/pgvector:pg16
+
+  - id: test
+    name: python:3.13-slim
+    entrypoint: bash
+    env:
+      - SECRET_KEY=ci-test-key
+      - DEBUG=False
+      - ALLOWED_HOSTS=localhost,127.0.0.1
+      - DATABASE_URL=postgres://revenact:revenact@pg:5432/revenact  # soc2:ignore ephemeral CI db
+      - CORS_ALLOWED_ORIGINS=http://localhost:5173
+      - PIP_DISABLE_PIP_VERSION_CHECK=1
+      - PYTHONUNBUFFERED=1
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # CPU-only torch first, for the local embedding provider the tests use.
+        pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+        pip install --quiet -r requirements-dev.txt
+        if [ "${_SHARD}" = 1 ]; then
+          ruff check .
+          ruff format --check .
+          python scripts/ci_shard_labels.py --check "${_SHARDS}"
+        fi
+        python - <<'EOF'
+        import socket, time
+        for _ in range(60):
+            try:
+                socket.create_connection(("pg", 5432), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(1)
+        else:
+            raise SystemExit("postgres did not start")
+        EOF
+        sleep 3
+        python manage.py migrate --noinput
+        labels=$$(python scripts/ci_shard_labels.py "${_SHARD}" "${_SHARDS}")
+        echo "shard ${_SHARD}/${_SHARDS}: $$(echo "$$labels" | wc -l) test classes"
+        # shellcheck disable=SC2086  # one argument per label, on purpose
+        python manage.py test --parallel auto --noinput $$labels
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 2400s

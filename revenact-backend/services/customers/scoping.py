@@ -1,0 +1,357 @@
+"""Who can see which Customers and Accounts — the single definition of
+record-level visibility, and the one place to change it.
+
+Until this module existed the only boundary anywhere was the tenant:
+every view scoped to `request.user.organisation` and stopped, so any
+member could read every customer, account, note, email and ticket in
+the organisation. Fine for a two-person team, wrong for a real one.
+
+The rule, for a user *without* `view_all_accounts`:
+
+* A **Customer** is visible if you own it, if you own one of its
+  Accounts, if someone below you in the org chart owns either, or if
+  nobody owns it.
+* An **Account** is visible if you own it, if you own one of its parent
+  Customers, if someone below you in the org chart owns either, or if
+  nobody owns it.
+
+Reaching in both directions is deliberate. Owning "Apple Inc" gives you
+its divisions; owning "Apple EMEA" lets you see the company it belongs
+to — without giving you its sibling divisions. A strictly-own rule
+would break the account page, whose header names the parent org and
+whose Organizations tab lists it: you'd get 404s inside a page you're
+allowed to open.
+
+Unowned records staying visible is also deliberate. An unowned record
+is nobody's secret, and hiding it would mean the unassigned queue
+becomes invisible to exactly the people meant to work it — including,
+before `perform_create` learned to default an owner, a record the
+caller had just made themselves.
+
+# Not the same thing as "my book"
+
+`CockpitSummaryView` and Copilot's `build_org_context_summary` filter
+`owner=user` strictly, and must keep doing so. That's a different
+question — *what am I responsible for*, not *what am I allowed to
+open* — and the answers genuinely differ: a customer you don't own but
+can see through an account should not count toward your own ARR.
+services/customers/tests/test_views.py pins that distinction. Don't
+route those two through here.
+
+# A consequence worth knowing
+
+`Account.customers` is a many-to-many. An Account linked to two
+Customers with different owners is visible to both of them, and its
+children appear in both Customers' rollups. That follows from the rule
+above plus the data model saying the two companies share the account —
+it's the M2M's meaning, not a hole in this module.
+"""
+
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+
+from services.accounts.capabilities import Capability
+
+from .models import Account, Customer
+
+
+class SystemActor:
+    """An organisation acting as itself: the principal a scheduled job uses.
+
+    Every rollup in this app takes a `user` and asks scoping what that user
+    may see. A nightly metric snapshot has no user, and picking "some admin"
+    to impersonate would tie a job to whichever person happens to hold a
+    role. This is the honest alternative: a principal that *is* the
+    organisation, sees all of it, and can never be confused with a person.
+    Only the two things scoping reads exist on it — `organisation` and
+    `has_capability` — so a rollup that quietly started depending on
+    anything else about a user would fail loudly here rather than see
+    something odd.
+    """
+
+    is_authenticated = True
+    pk = None
+    id = None
+    owner_scope = None
+
+    def __init__(self, organisation):
+        self.organisation = organisation
+
+    def has_capability(self, capability):
+        return True
+
+    def __repr__(self):
+        return f"SystemActor({self.organisation!r})"
+
+
+class ScopeActor:
+    """A slice of the organisation read by one person: the book of one set
+    of owners — a reader's Me (themselves) or My team (themselves and
+    everyone below them), or one owner-cut initiative's person — counted by
+    the rules of `principal`. Built only in `services.brain.scope`
+    (`resolve` and `book_actor`); a test greps the services to keep it that
+    way.
+
+    Two things, kept apart. The **book**: `visible_customers` and
+    `visible_accounts` read `owner_scope` before anything else and return
+    exactly the owners' customers and accounts — no unowned records, and no
+    reach through an account up to its organisation. **Who is counting**:
+    everything a rule asks about a person — `has_capability`, `function`,
+    `id`/`pk` (and so the org chart below them) — is the principal's, so
+    department pipeline (`pipeline_visible_q`), ticket departments and the
+    mail, note and task chains (`activity_tracking.readable`) count only
+    what that person may read. The principal is the reader for a live read,
+    and the scope's own user for a month-end row. Not a `SystemActor`: it
+    never reads as the whole organisation."""
+
+    is_authenticated = True
+
+    def __init__(self, principal, owner_ids):
+        self.principal = principal
+        self.organisation = principal.organisation
+        self.owner_scope = frozenset(owner_ids)
+
+    @property
+    def id(self):
+        return self.principal.id
+
+    @property
+    def pk(self):
+        return self.principal.pk
+
+    @property
+    def function(self):
+        return self.principal.function
+
+    def has_capability(self, capability):
+        # SOC2:AUTH-02 a scope counts with its principal's rights, never more
+        return self.principal.has_capability(capability)
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}({self.organisation!r}, {sorted(self.owner_scope)}, "
+            f"principal={self.principal.pk})"
+        )
+
+
+def sees_everything(user) -> bool:
+    """Superusers are covered by `User.has_capability` itself, which
+    returns True for them before it ever looks at a Role."""
+    return user.has_capability(Capability.VIEW_ALL_ACCOUNTS)
+
+
+def visible_customers(user):
+    """Every Customer this user may open, as a queryset.
+
+    Archived customers are *not* excluded here — `CustomerListCreateView`
+    filters those out itself while `CustomerDetailView` deliberately
+    doesn't (you can still open an archived record by id). Folding that
+    in would quietly change the detail view."""
+
+    base = Customer.objects.filter(organisation=user.organisation)
+    owner_scope = getattr(user, "owner_scope", None)
+    if owner_scope is not None:
+        # SOC2:AUTH-02 a Brain scope's book is exactly its owners' customers
+        return base.filter(owner_id__in=sorted(owner_scope))
+    if sees_everything(user):
+        return base
+    # Beyond the CSM's own book: a customer someone answers for in another
+    # function, or was asked or asked about in — the knowledge layer
+    # (services.knowledge) brings engineers, sales and analysts to an
+    # account's page, and a notification that links there must open it.
+    # The org chart: a manager sees the customers their reports own, and
+    # those under which a report owns an account, all the way down
+    # (services.accounts.hierarchy) — the same reach `visible_accounts` gives.
+    # SOC2:AUTH-02
+    from services.accounts.hierarchy import subtree_ids
+    from services.knowledge.models import Contribution, FunctionOwner, Question
+
+    reports = subtree_ids(user)
+    # One `id IN (...)` per way in, never joins de-duplicated with DISTINCT:
+    # PostgreSQL 16 planned the join-and-DISTINCT form so badly that a call
+    # took about a second (test_scoping.VisibilityQueryShapeTests).
+    links = Account.customers.through.objects
+    return base.filter(
+        Q(owner=user)
+        | Q(owner_id__in=reports)
+        | Q(owner__isnull=True)
+        | Q(
+            id__in=links.filter(Q(account__owner=user) | Q(account__owner_id__in=reports)).values(
+                "customer_id"
+            )
+        )
+        | Q(id__in=FunctionOwner.objects.filter(user=user).values("customer_id"))
+        | Q(
+            id__in=Question.objects.filter(Q(assignee=user) | Q(asked_by=user)).values(
+                "customer_id"
+            )
+        )
+        | Q(id__in=Contribution.objects.filter(author=user).values("customer_id"))
+    )
+
+
+def live_customers(user):
+    """The book as it stands: visible, not archived, **and not churned**.
+
+    What every dashboard means by "the book". A customer with a `churn_date`
+    has left — they do not belong in a triage queue, a seat-utilisation rate,
+    or an ARR forecast's opening balance. Archiving alone was the filter for a
+    while, which let a churned-but-unarchived customer keep contributing live
+    ARR to the Revenue Forecast; churn and archive are separate actions by
+    design (you can wind an account down while keeping it visible), so
+    excluding one is not excluding the other.
+
+    Not used by the Organizations list, which applies a broader rule of its
+    own: it hides churned rows by default — a `churn_date` *or* the Churn
+    stage (`organizations.book.CHURNED`) — and shows them on
+    `include_churned=1`, a `churn` lifecycle filter, or by `ids`, so a churned
+    record stays reachable. Nor by the Customer Overview, whose whole subject
+    is logo retention and churn reasons, and which would compute 100%
+    retention over survivors only.
+    """
+    return visible_customers(user).filter(is_archived=False, churn_date__isnull=True)
+
+
+def visible_accounts(user):
+    """Every Account this user may open, as a queryset.
+
+    The organisation and ownership predicates are separate `.filter()`
+    calls on purpose: chaining gives each its own join through the M2M,
+    so this reads "has some Customer in my org AND has some Customer
+    owned by me" rather than requiring one single Customer to satisfy
+    both at once. Within a tenant the two happen to coincide, but the
+    chained form is the one that stays correct if that ever stops being
+    true.
+
+    The org chart reaches accounts the same way it reaches customers in
+    `visible_customers`: a manager sees an account a report owns, or one
+    under a customer a report owns, all the way down
+    (services.accounts.hierarchy). Without it a manager could open a
+    report's organisation but not the report's own division inside it.
+
+    Deliberately *not* widened for `visible_customers`' knowledge-layer
+    reach (function owners, questions, contributions): those open an
+    organisation's page so a question can be answered there, not its
+    accounts — a separate decision."""
+
+    # `id IN (...)` through the link table rather than a join, so an account
+    # under several customers appears once without DISTINCT (see
+    # visible_customers on why DISTINCT is avoided).
+    links = Account.customers.through.objects
+    base = Account.objects.filter(
+        id__in=links.filter(customer__organisation=user.organisation).values("account_id")
+    )
+    owner_scope = getattr(user, "owner_scope", None)
+    if owner_scope is not None:
+        owners = sorted(owner_scope)
+        # SOC2:AUTH-02 a Brain scope's accounts: its owners' own and those
+        # under its owners' customers
+        return base.filter(
+            Q(owner_id__in=owners)
+            | Q(id__in=links.filter(customer__owner_id__in=owners).values("account_id"))
+        )
+    if sees_everything(user):
+        return base
+    from services.accounts.hierarchy import subtree_ids
+
+    reports = subtree_ids(user)
+    # SOC2:AUTH-02 an account is visible to its owner's management chain
+    return base.filter(
+        Q(owner=user)
+        | Q(owner_id__in=reports)
+        | Q(owner__isnull=True)
+        | Q(
+            id__in=links.filter(Q(customer__owner=user) | Q(customer__owner_id__in=reports)).values(
+                "account_id"
+            )
+        )
+    )
+
+
+def pipeline_visible_q(user) -> Q:
+    """Opportunities and risks are read department-wise: a person sees
+    their own department's plus the undeparted ones; a role that may view
+    all accounts, and Leadership, see every department's."""
+    from services.accounts.models import User
+
+    if sees_everything(user) or user.function == User.Function.LEADERSHIP:
+        return Q()
+    # SOC2:AUTH-02 object-level rule for departmental pipeline items
+    return Q(department="") | Q(department=user.function)
+
+
+def visible_children_q(user, prefix: str = "") -> Q:
+    """For the models that hang off a Customer *or* an Account — Task,
+    Note, Email, Ticket, Contact, Opportunity, Risk, Survey, Canvas,
+    Headline, CustomObjectRecord.
+
+    Drops straight into the place those views currently write
+    `Q(customer__organisation=org) | Q(account__customers__organisation=org)`,
+    and means the same thing when the caller holds the capability.
+
+    `prefix` reaches the same rule through another model's relation —
+    e.g. `visible_children_q(user, prefix="calls__")` on a `Contact`
+    queryset counts only the calls the viewer may open, for an
+    `annotate(Count(..., filter=...))` rather than a query per row."""
+
+    return Q(**{f"{prefix}customer__in": visible_customers(user)}) | Q(
+        **{f"{prefix}account__in": visible_accounts(user)}
+    )
+
+
+def customer_rollup_q(user, customer) -> Q:
+    """For the `/customers/<id>/…` roll-ups of the models that hang off a
+    Customer *or* an Account: this organisation's own records, plus those on
+    its accounts that the user may open.
+
+    Being able to open the organisation is not enough for an account-level
+    record: an account owned by a colleague stays theirs (`visible_accounts`),
+    the same rule `get_visible_account` applies to the account's own nested
+    routes and the organisation story applies to its sources."""
+
+    # SOC2:AUTH-02 an account-level record follows its own account's visibility
+    return Q(customer=customer) | Q(account__in=visible_accounts(user).filter(customers=customer))
+
+
+def get_visible_customer(request, customer_id):
+    """The one place Customer-scoped nested views resolve their parent.
+
+    A customer outside your visibility is a 404, not a 403 and not an
+    empty list — the same "404, not an empty list" convention these
+    views already used for another organisation's ids, now applied to
+    another owner's. It also avoids the detail view confirming that a
+    record exists to someone who can't see it."""
+
+    return get_object_or_404(visible_customers(request.user), pk=customer_id)
+
+
+def get_visible_account(request, customer_id, account_id):
+    """Account-scoped equivalent. `customers=customer_id` pins the
+    Account under the URL's own Customer, so the nested route keeps
+    meaning what it says — visibility is necessary but not sufficient."""
+
+    return get_object_or_404(visible_accounts(request.user), pk=account_id, customers=customer_id)
+
+
+def get_url_account(request, kwargs):
+    """The account a per-account view reads, from either of its routes:
+    nested (`/customers/<customer_id>/accounts/<account_id>/…`, pinned under
+    that organisation by `get_visible_account`) or flat
+    (`/accounts/<account_id>/…`, the account page's, which may have no
+    organisation the viewer can open). Both 404 alike for an account the
+    viewer cannot open, whether or not it exists."""
+    if "customer_id" in kwargs:
+        return get_visible_account(request, kwargs["customer_id"], kwargs["account_id"])
+    # SOC2:AUTH-02 the flat route: the account must be one the viewer may open, else 404
+    return get_object_or_404(visible_accounts(request.user), pk=kwargs["account_id"])
+
+
+def can_open(user, record) -> bool:
+    """Whether `user` is active and may open `record` (a Customer or an
+    Account): the one check behind every "who may this go to" rule (a plan's
+    owner and assignees, a task's assignee, a notification naming a record)."""
+    if user is None or not user.is_active:
+        return False
+    rows = visible_customers(user) if isinstance(record, Customer) else visible_accounts(user)
+    # SOC2:AUTH-02 work goes only to people who can open its record
+    return rows.filter(pk=record.pk).exists()

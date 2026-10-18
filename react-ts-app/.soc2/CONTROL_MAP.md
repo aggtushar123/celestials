@@ -1,0 +1,24 @@
+# SOC 2 Control Map — react-ts-app
+
+Browser-client controls only. API, data and infrastructure controls are mapped in
+`revenact-backend/.soc2/CONTROL_MAP.md`. Update in the same PR as the code.
+
+Status: **met** | **partial** | **missing** | **excepted** (see `EXCEPTIONS.md`) | **n/a**
+
+| Requirement | Status | Implementation (file:symbol) | Evidence | Owner | Last verified |
+|-------------|--------|------------------------------|----------|-------|---------------|
+| AUTH-01 | met | `src/components/auth/ProtectedRoute.tsx` gates routes; `src/lib/apiClient.ts` attaches the bearer token and retries once after a refresh | `ProtectedRoute.test.tsx`, `apiClient.test.ts` | @aggtushar123 | 2026-09-15 |
+| AUTH-05 | partial | `src/features/auth/authSlice.ts:refreshSession` stores the rotated refresh token the backend now returns (single-use tokens) and logs out when a refresh is rejected. Gap: access and refresh tokens still live in `localStorage` (readable by any XSS); moving the refresh token to an httpOnly cookie is gap report #14 | `authSlice.test.ts` "refresh session" | @aggtushar123 | 2026-09-15 |
+| API-02 | met | React escaping throughout; no `dangerouslySetInnerHTML`, `innerHTML` or `eval`; production CSP `script-src 'self'` set by Caddy (`revenact-infra/deploy/Caddyfile`) | `grep -rn dangerouslySetInnerHTML src` → none; `dist/index.html` has no inline scripts | @aggtushar123 | 2026-09-15 |
+| API-06 | met | Security headers and CSP for the SPA in `deploy/nginx.conf` (HSTS, nosniff, frame DENY, referrer, permissions policy, CSP allowing Google Fonts and same-origin API/WebSocket at the configured `PUBLIC_HOST`); the client's `Host` header is never forwarded, and only a WebSocket upgrade reaches Django (no h2c smuggling) | `curl -I https://revenact-web-605430842839.asia-south1.run.app/`; semgrep `p/security-audit` clean on every PR | @aggtushar123 | 2026-10-15 |
+| DATA-06 | partial | Only `VITE_API_URL` is baked into the bundle; no secrets. JWTs and the user profile in `localStorage` (see AUTH-05) | `.env.example`, `Dockerfile` | | 2026-09-15 |
+| SEC-01 | met | `.env` git-ignored; gitleaks on every PR (`cloudbuild-soc2.yaml: secret-scan`, full history when the build carries `.git`, else the tree) and pre-commit (`.pre-commit-config.yaml`); `.gitleaks.toml` allowlist | Cloud Build (`revenact-prod`, asia-south1) build of trigger `frontend-soc2`, step `secret-scan` | @aggtushar123 | 2026-10-15 |
+| SEC-03 | met | `package-lock.json`; `npm audit --omit=dev --audit-level=high` on every PR (`cloudbuild-soc2.yaml: dependency-scan`); CI tool images pinned by version; Dependabot weekly for npm (`.github/dependabot.yml`) | Cloud Build (`revenact-prod`, asia-south1) step `dependency-scan`, Dependabot PRs | @aggtushar123 | 2026-10-15 |
+| SEC-04 | met | semgrep `p/security-audit`, `p/secrets`, `p/owasp-top-ten`, `p/react`, `p/typescript` on every PR (`cloudbuild-soc2.yaml: static-analysis`) | Cloud Build (`revenact-prod`, asia-south1) step `static-analysis` | @aggtushar123 | 2026-10-15 |
+| SEC-05 | met | `Dockerfile`: builds with `node:22-alpine`, serves from `nginxinc/nginx-unprivileged:1.29.2-alpine` (uid 101, port 8080, no secrets) as the ingress container of the Cloud Run web service (`deploy/nginx.conf`); every image is built fresh by Cloud Build (`cloudbuild.yaml`) and deployed by digest | `Dockerfile`, `deploy/nginx.conf` | @aggtushar123 | 2026-10-15 |
+| CHG-01 | met | GitHub ruleset "main: pull requests and green checks only": changes to `main` only via pull request, force pushes and deletion blocked, no bypass actors (repo public since 2026-09-16; EX-001 closed) | `gh api repos/aggtushar123/revenact-frontend/rulesets` | @aggtushar123 | 2026-09-16 |
+| CHG-02 | partial | Every PR to `main` runs `cloudbuild-ci.yaml` (npm ci, eslint, vitest, build) and `cloudbuild-soc2.yaml` (gitleaks, npm audit, semgrep, heuristic scan); each is a Cloud Build check on the PR (triggers `frontend-pr`, `frontend-soc2` in `revenact-deploy/terraform/cloudbuild.tf`). They cannot be **required** while the repository is private on GitHub Free (EX-001); merges are by the maintainer after the checks are green | PR checks; `gcloud builds list --region asia-south1 --filter=substitutions._PR_NUMBER=<n>` | @aggtushar123 | 2026-10-15 |
+| CHG-03 | met | `.github/pull_request_template.md` with the SOC 2 checklist | | @aggtushar123 | 2026-09-15 |
+| CHG-04 | met | `.github/CODEOWNERS` (auth, API client, CI, Dockerfile, `.soc2/`) | | @aggtushar123 | 2026-09-15 |
+| EVD-01 | met | This file; `.claude/skills/soc2-dev/scripts/control_map.py` drift check + scanner on every PR (`cloudbuild-soc2.yaml: soc2-scan`, fails on critical) | Cloud Build (`revenact-prod`, asia-south1) step `soc2-scan` | @aggtushar123 | 2026-10-15 |
+| EVD-03 | met | `.soc2/EXCEPTIONS.md` | | @aggtushar123 | 2026-09-15 |

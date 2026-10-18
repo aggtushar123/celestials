@@ -1,0 +1,180 @@
+from django.urls import path
+
+from . import canvas_views, views
+
+urlpatterns = [
+    path("", views.CustomerListCreateView.as_view(), name="customer-list-create"),
+    path("stats/", views.CustomerStatsView.as_view(), name="customer-stats"),
+    path("health/", views.CustomerHealthView.as_view(), name="customer-health"),
+    # Usage Overview's own rollups. Alongside health/ rather than under a
+    # top-level /usage/ prefix: seats belong to a Customer, and this is a
+    # rollup of customers, not of a thing with its own model.
+    path("usage/", views.CustomerUsageView.as_view(), name="customer-usage"),
+    # Revenue Forecast's ARR bridge. Alongside usage/ and health/ for the same
+    # reason: it is a rollup of customers, not of a thing with its own model.
+    path("forecast/", views.CustomerForecastView.as_view(), name="customer-forecast"),
+    # Activity Tracking's coverage and cadence rollups. Same reasoning as
+    # health/, usage/ and forecast/: a rollup of customers.
+    path("activity/", views.ActivityTrackingView.as_view(), name="customer-activity"),
+    # Customer Overview's portfolio rollups. The one dashboard endpoint that
+    # includes archived and churned customers — see its own docstring.
+    path("overview/", views.CustomerOverviewView.as_view(), name="customer-overview"),
+    # Product Usage — one row per product. Under /customers/ like its
+    # siblings because it is a rollup of customers grouped by a field on
+    # them; there is no Product model to hang it off, which is the same
+    # limitation its own attribution note names.
+    path("products/", views.ProductUsageView.as_view(), name="customer-products"),
+    path(
+        "<int:customer_id>/accounts/",
+        views.AccountListCreateView.as_view(),
+        name="customer-accounts",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:pk>/",
+        views.AccountDetailView.as_view(),
+        name="account-detail",
+    ),
+    path(
+        "<int:customer_id>/activities/",
+        views.CustomerActivityListView.as_view(),
+        name="customer-activities",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/activities/",
+        views.AccountActivityListView.as_view(),
+        name="account-activities",
+    ),
+    path(
+        "<int:customer_id>/emails/",
+        views.CustomerEmailListView.as_view(),
+        name="customer-emails",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/emails/",
+        views.AccountEmailListView.as_view(),
+        name="account-emails",
+    ),
+    path(
+        "<int:customer_id>/tasks/",
+        views.CustomerTaskListView.as_view(),
+        name="customer-tasks",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/tasks/",
+        views.AccountTaskListView.as_view(),
+        name="account-tasks",
+    ),
+    path(
+        "<int:customer_id>/notes/",
+        views.CustomerNoteListView.as_view(),
+        name="customer-notes",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/notes/",
+        views.AccountNoteListView.as_view(),
+        name="account-notes",
+    ),
+    path("<int:customer_id>/files/", views.CustomerFileListView.as_view(), name="customer-files"),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/files/",
+        views.AccountFileListView.as_view(),
+        name="account-files",
+    ),
+    path("<int:customer_id>/calls/", views.CustomerCallListView.as_view(), name="customer-calls"),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/calls/",
+        views.AccountCallListView.as_view(),
+        name="account-calls",
+    ),
+    path(
+        "<int:customer_id>/tickets/",
+        views.CustomerTicketListView.as_view(),
+        name="customer-tickets",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/tickets/",
+        views.AccountTicketListView.as_view(),
+        name="account-tickets",
+    ),
+    path(
+        "<int:customer_id>/calendar-events/",
+        views.CustomerCalendarEventListView.as_view(),
+        name="customer-calendar-events",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/calendar-events/",
+        views.AccountCalendarEventListView.as_view(),
+        name="account-calendar-events",
+    ),
+    path(
+        "<int:customer_id>/contacts/",
+        views.CustomerContactListView.as_view(),
+        name="customer-contacts",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/contacts/",
+        views.AccountContactListView.as_view(),
+        name="account-contacts",
+    ),
+    path(
+        "<int:customer_id>/opportunities/",
+        views.CustomerOpportunityListView.as_view(),
+        name="customer-opportunities",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/opportunities/",
+        views.AccountOpportunityListView.as_view(),
+        name="account-opportunities",
+    ),
+    path(
+        "<int:customer_id>/risks/",
+        views.CustomerRiskListView.as_view(),
+        name="customer-risks",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/risks/",
+        views.AccountRiskListView.as_view(),
+        name="account-risks",
+    ),
+    path(
+        "<int:customer_id>/surveys/",
+        views.CustomerSurveyListView.as_view(),
+        name="customer-surveys",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/surveys/",
+        views.AccountSurveyListView.as_view(),
+        name="account-surveys",
+    ),
+    path(
+        "<int:customer_id>/canvases/",
+        canvas_views.CustomerCanvasListView.as_view(),
+        name="customer-canvases",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/canvases/",
+        canvas_views.AccountCanvasListView.as_view(),
+        name="account-canvases",
+    ),
+    path(
+        "<int:customer_id>/headlines/",
+        views.CustomerHeadlineListCreateView.as_view(),
+        name="customer-headlines",
+    ),
+    path(
+        "<int:customer_id>/headlines/generate/",
+        views.HeadlineGenerateView.as_view(),
+        name="customer-headlines-generate",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/headlines/",
+        views.AccountHeadlineListCreateView.as_view(),
+        name="account-headlines",
+    ),
+    path(
+        "<int:customer_id>/accounts/<int:account_id>/headlines/generate/",
+        views.HeadlineGenerateView.as_view(),
+        name="account-headlines-generate",
+    ),
+    path("<int:pk>/", views.CustomerDetailView.as_view(), name="customer-detail"),
+]

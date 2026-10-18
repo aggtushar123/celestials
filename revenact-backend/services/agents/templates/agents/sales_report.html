@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sales report {{ end|date:"Y-m-d" }}</title>
+<style>
+  @page { size: A4; margin: 14mm; }
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: #ffffff; color: #1c1917;
+         font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .page { max-width: 760px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: flex-end;
+           border-bottom: 1px solid #e7e5e4; padding-bottom: 10px; margin-bottom: 14px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .muted { color: #78716c; }
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+  .tile { border: 1px solid #e7e5e4; border-radius: 8px; padding: 8px 10px; }
+  .tile b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+  .summary { border-left: 3px solid #1c1917; padding: 4px 10px; margin: 0 0 14px; }
+  h2 { font-size: 13px; margin: 14px 0 6px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #f0efed; vertical-align: top; }
+  th { font-weight: 600; color: #57534e; font-size: 11px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  footer { margin-top: 16px; border-top: 1px solid #e7e5e4; padding-top: 8px; font-size: 10px; }
+  @media print { body { padding: 0; } .tile, table { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div>
+      <h1>Sales report</h1>
+      <div class="muted">{{ workspace }}{% if meeting %} · for {{ meeting }}{% if starts %}, {{ starts }}{% endif %}{% endif %}</div>
+    </div>
+    <div class="muted">{{ start|date:"j M Y" }} – {{ end|date:"j M Y" }}</div>
+  </header>
+
+  <div class="tiles">
+    <div class="tile"><span class="muted">Won</span><b>{{ totals.won_amount }}</b>{{ totals.won_count }} deal{{ totals.won_count|pluralize }}</div>
+    <div class="tile"><span class="muted">Lost</span><b>{{ totals.lost_amount }}</b>{{ totals.lost_count }} deal{{ totals.lost_count|pluralize }}</div>
+    <div class="tile"><span class="muted">Closing in 30 days</span><b>{{ totals.closing_amount }}</b>{{ totals.closing_count }} deal{{ totals.closing_count|pluralize }}</div>
+    <div class="tile"><span class="muted">Win rate</span><b>{% if totals.win_rate is not None %}{{ totals.win_rate }}%{% else %}–{% endif %}</b>{{ totals.open_count }} open</div>
+  </div>
+
+  {% if summary %}<p class="summary">{{ summary }}</p>{% endif %}
+
+  <div class="cols">
+    <section>
+      <h2>Won</h2>
+      {% if won %}
+      <table>
+        <tr><th>Deal</th><th class="num">Amount</th><th class="num">Closed</th></tr>
+        {% for row in won %}<tr><td>{{ row.name }}<br><span class="muted">{{ row.record }}</span></td><td class="num">{{ row.amount }}</td><td class="num">{{ row.day|date:"j M" }}</td></tr>{% endfor %}
+      </table>
+      {% if totals.won_count > rows_cut %}<p class="muted">The largest {{ rows_cut }} of {{ totals.won_count }}.</p>{% endif %}
+      {% else %}<p class="muted">No deals won in this period.</p>{% endif %}
+    </section>
+    <section>
+      <h2>Lost</h2>
+      {% if lost %}
+      <table>
+        <tr><th>Deal</th><th class="num">Amount</th><th class="num">Closed</th></tr>
+        {% for row in lost %}<tr><td>{{ row.name }}<br><span class="muted">{{ row.record }}</span></td><td class="num">{{ row.amount }}</td><td class="num">{{ row.day|date:"j M" }}</td></tr>{% endfor %}
+      </table>
+      {% if totals.lost_count > rows_cut %}<p class="muted">The largest {{ rows_cut }} of {{ totals.lost_count }}.</p>{% endif %}
+      {% else %}<p class="muted">No deals lost in this period.</p>{% endif %}
+    </section>
+  </div>
+
+  <h2>Closing in the next 30 days</h2>
+  {% if closing %}
+  <table>
+    <tr><th>Deal</th><th>Stage</th><th class="num">Amount</th><th class="num">Closes</th></tr>
+    {% for row in closing %}<tr><td>{{ row.name }} <span class="muted">· {{ row.record }}</span></td><td>{{ row.stage }}</td><td class="num">{{ row.amount }}</td><td class="num">{{ row.day|date:"j M" }}</td></tr>{% endfor %}
+  </table>
+  {% if totals.closing_count > rows_cut %}<p class="muted">The first {{ rows_cut }} of {{ totals.closing_count }}.</p>{% endif %}
+  {% else %}<p class="muted">Nothing is expected to close in the next 30 days.</p>{% endif %}
+
+  <h2>Stages</h2>
+  <table>
+    <tr><th>Stage</th><th class="num">Deals</th><th class="num">Amount</th><th class="num">Moved in</th></tr>
+    {% for row in stages %}<tr><td>{{ row.label }}</td><td class="num">{{ row.count }}</td><td class="num">{{ row.amount }}</td><td class="num">{{ row.moved_in }}</td></tr>{% endfor %}
+  </table>
+  <p class="muted">Moved in: deals whose stage changed into it during the period. Moves out of a stage are not recorded.</p>
+
+  <footer class="muted">
+    Amounts are monthly recurring revenue. Only deals you can see in Revenact are included.
+    Generated {{ generated }} by Revenact.
+  </footer>
+</div>
+</body>
+</html>

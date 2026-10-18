@@ -1,0 +1,51 @@
+# Cloud Build (revenact-prod): on every push to main, build the ingress image,
+# push it to Artifact Registry, and hand its digest to the public
+# revenact-deploy repo, whose workflow rolls it out to Cloud Run. The source
+# stays private; only the digest leaves GCP.
+substitutions:
+  _IMAGE: asia-south1-docker.pkg.dev/revenact-prod/revenact/frontend
+
+steps:
+  - id: pull-cache
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: ["-c", "docker pull ${_IMAGE}:latest || true"]
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --cache-from=${_IMAGE}:latest
+      - --build-arg=BUILDKIT_INLINE_CACHE=1
+      - --tag=${_IMAGE}:$SHORT_SHA
+      - --tag=${_IMAGE}:latest
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "--all-tags", "${_IMAGE}"]
+
+  - id: dispatch
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    secretEnv: ["GITHUB_DISPATCH_TOKEN"]
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        digest=$(gcloud artifacts docker images describe "${_IMAGE}:$SHORT_SHA" --format='value(image_summary.digest)')
+        image="${_IMAGE}@$${digest}"
+        echo "dispatching $${image}"
+        curl -fsS -X POST \
+          -H "Authorization: Bearer $${GITHUB_DISPATCH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/aggtushar123/revenact-deploy/dispatches \
+          -d "{\"event_type\":\"image-built\",\"client_payload\":{\"component\":\"frontend\",\"image\":\"$${image}\",\"commit\":\"$COMMIT_SHA\"}}"
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/revenact-prod/secrets/github-dispatch-token/versions/latest
+      env: GITHUB_DISPATCH_TOKEN
+
+options:
+  logging: CLOUD_LOGGING_ONLY

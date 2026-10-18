@@ -1,0 +1,640 @@
+"""The internal portal: Revenact staff administering every tenant.
+
+    GET    /api/v1/platform/overview/
+    GET    /api/v1/platform/organisations/?q=&status=
+    POST   /api/v1/platform/organisations/                { name, owner_email, owner_name? }
+    GET    /api/v1/platform/organisations/<id>/
+    PATCH  /api/v1/platform/organisations/<id>/           { name }
+    DELETE /api/v1/platform/organisations/<id>/           { reason }   (archives; nothing is purged)
+    POST   /api/v1/platform/organisations/<id>/status/    { status, reason }
+    POST   /api/v1/platform/organisations/<id>/gmail/     { enabled, reason }
+    POST   /api/v1/platform/organisations/<id>/owner/     { user_id }
+    GET    /api/v1/platform/staff/
+
+Every view requires `IsPlatformStaff`: a superuser signed in with a second
+factor. Every action is audited with the tenant as `organisation`, so a
+customer's audit trail shows what Revenact did to them alongside what they
+did themselves.
+
+**Metadata only.** Nothing here reaches a tenant's customers, emails, notes,
+tickets or calls. What staff see is who owns an organisation, who is in it,
+what it has claimed, what state it is in, and what happened to it. Support
+questions about content are answered by asking the owner; this surface is
+not a way around that. The test suite asserts the detail payload's keys.
+"""
+
+from django.conf import settings
+from django.db.models import Count, Q
+from rest_framework import status, views
+from rest_framework.response import Response
+
+from core import audit
+from core.models import AuditEvent
+from services.accounts.models import Organisation, User
+from services.accounts.permissions import IsPlatformStaff
+from services.identity import domains, ownership
+from services.identity.models import (
+    AccessRequest,
+    Invitation,
+    OrganizationDomain,
+    OrganizationMembership,
+)
+from services.mail.models import MailboxConnection
+
+
+def _error(code, message, http_status=status.HTTP_400_BAD_REQUEST):
+    return Response({"success": False, "error": {"code": code, "message": message}}, http_status)
+
+
+def _owner(organisation):
+    membership = ownership.owner_membership(organisation)
+    if membership is None:
+        return None
+    return {"id": membership.user_id, "name": membership.user.name, "email": membership.user.email}
+
+
+#: A workspace with no live Google connection.
+NO_GMAIL = {"connected": 0, "paused": 0}
+
+
+def _gmail_counts(organisation_ids):
+    """{organisation id: {connected, paused}} over live Google connections (each
+    holds a Google test-user slot, paused and errored ones included), in one
+    aggregate query. Counts only: no address, no content."""
+    rows = (
+        MailboxConnection.objects.filter(
+            organisation_id__in=organisation_ids, provider=MailboxConnection.Provider.GOOGLE
+        )
+        .exclude(status=MailboxConnection.Status.DISCONNECTED)
+        .values("organisation_id")
+        .annotate(connected=Count("id"), paused=Count("id", filter=~Q(paused_reason="")))
+        .values_list("organisation_id", "connected", "paused")
+    )
+    return {org: {"connected": connected, "paused": paused} for org, connected, paused in rows}
+
+
+def _summary(organisation, counts):
+    return {
+        "id": organisation.id,
+        "name": organisation.name,
+        "slug": organisation.slug,
+        "status": organisation.status,
+        "created_at": organisation.created_at,
+        "owner": _owner(organisation),
+        "members_active": counts.get("members_active", 0),
+        "pending_requests": counts.get("pending_requests", 0),
+        "domains": [
+            {"domain": d.domain, "verification_status": d.verification_status}
+            for d in organisation.domains.all()
+        ],
+        "plan": _plan(organisation),
+        "gmail": {"enabled": organisation.gmail_two_way_enabled, **counts.get("gmail", NO_GMAIL)},
+    }
+
+
+def _plan(organisation):
+    from services.billing import accounts as billing_accounts
+
+    account = billing_accounts.ensure(organisation)
+    return billing_accounts.summary(account)
+
+
+class OverviewView(views.APIView):
+    """GET /api/v1/platform/overview/ — the numbers on the portal's front page."""
+
+    permission_classes = [IsPlatformStaff]
+
+    def get(self, request):
+        by_status = dict(
+            Organisation.objects.values_list("status")
+            .annotate(n=Count("id"))
+            .values_list("status", "n")
+        )
+        return Response(
+            {
+                "organisations": {
+                    "total": sum(by_status.values()),
+                    **{s: by_status.get(s, 0) for s, _ in Organisation.Status.choices},
+                },
+                "members_active": OrganizationMembership.objects.filter(status="active").count(),
+                "pending_requests": AccessRequest.objects.filter(status="pending").count(),
+                "open_invitations": Invitation.objects.filter(status="pending").count(),
+                "verified_domains": OrganizationDomain.objects.filter(
+                    verification_status="verified"
+                ).count(),
+                "staff": User.objects.filter(is_superuser=True, is_active=True).count(),
+                "gmail": {
+                    "enabled_workspaces": Organisation.objects.filter(
+                        gmail_two_way_enabled=True
+                    ).count(),
+                    "connected": MailboxConnection.objects.filter(
+                        provider=MailboxConnection.Provider.GOOGLE
+                    )
+                    .exclude(status=MailboxConnection.Status.DISCONNECTED)
+                    .count(),
+                    # The one Google Cloud project's test-user limit, platform-wide.
+                    "test_user_cap": settings.GMAIL_TEST_USER_CAP,
+                },
+            }
+        )
+
+
+class OrganisationListView(views.APIView):
+    """GET /api/v1/platform/organisations/?q=<name or domain>&status=<status>
+    POST /api/v1/platform/organisations/ { name, owner_email, owner_name? }
+
+    Creating a tenant creates its **root user** in the same transaction: the
+    owner, holding the built-in Admin role, with no password (they sign in
+    with Google or Microsoft on that address, or set a password from the
+    reset email if mail is configured). One tenant per person in this phase,
+    so an address already in use anywhere is refused.
+
+    Archived organisations are left out unless asked for by status.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def post(self, request):
+        from django.db import transaction
+
+        from services.email import send_password_reset_email
+
+        name = str(request.data.get("name", "")).strip()
+        owner_email = str(request.data.get("owner_email", "")).strip().lower()
+        owner_name = str(request.data.get("owner_name", "")).strip()
+        if not name:
+            return _error("INVALID_NAME", "Give the organisation a name.")
+        if "@" not in owner_email:
+            return _error("INVALID_EMAIL", "The owner needs a valid email address.")
+        if User.objects.filter(email__iexact=owner_email).exists():
+            return _error("EMAIL_TAKEN", "That address already belongs to an account.")
+
+        with transaction.atomic():
+            organisation = Organisation.objects.create(name=name)
+            owner = User.objects.create_user(
+                email=owner_email,
+                password=None,
+                name=owner_name or owner_email.split("@")[0],
+                organisation=organisation,
+                role=User.Role.ADMIN,
+            )
+            ownership.claim(owner, organisation)
+            # The founder holds seat one; the membership signal opened it.
+
+        audit.record(  # SOC2:LOG-01
+            "platform.organisation.created",
+            request=request,
+            actor=request.user,
+            organisation=organisation,
+            target=organisation,
+            metadata={"name": name, "owner": owner_email},
+        )
+        # Best effort: lets the owner choose a password where mail is set up;
+        # a provider sign-in on the same address works regardless.
+        try:
+            send_password_reset_email(owner)
+            mailed = True
+        except Exception:  # noqa: BLE001 - mail is optional here
+            mailed = False
+
+        organisation = Organisation.objects.prefetch_related("domains").get(pk=organisation.pk)
+        return Response(
+            {**_summary(organisation, {"members_active": 1}), "owner_mailed": mailed},
+            status=status.HTTP_201_CREATED,
+        )
+
+    def get(self, request):
+        rows = Organisation.objects.all().prefetch_related("domains").order_by("name")
+        wanted = request.query_params.get("status", "")
+        if wanted:
+            rows = rows.filter(status=wanted)
+        else:
+            rows = rows.exclude(status=Organisation.Status.ARCHIVED)
+        q = request.query_params.get("q", "").strip()
+        if q:
+            rows = rows.filter(Q(name__icontains=q) | Q(domains__domain__icontains=q)).distinct()
+
+        ids = [o.id for o in rows]
+        members = dict(
+            OrganizationMembership.objects.filter(organisation_id__in=ids, status="active")
+            .values_list("organisation_id")
+            .annotate(n=Count("id"))
+            .values_list("organisation_id", "n")
+        )
+        pending = dict(
+            AccessRequest.objects.filter(organisation_id__in=ids, status="pending")
+            .values_list("organisation_id")
+            .annotate(n=Count("id"))
+            .values_list("organisation_id", "n")
+        )
+        gmail = _gmail_counts(ids)
+        return Response(
+            [
+                _summary(
+                    o,
+                    {
+                        "members_active": members.get(o.id, 0),
+                        "pending_requests": pending.get(o.id, 0),
+                        "gmail": gmail.get(o.id, NO_GMAIL),
+                    },
+                )
+                for o in rows
+            ]
+        )
+
+
+class OrganisationDetailView(views.APIView):
+    """GET / PATCH / DELETE /api/v1/platform/organisations/<id>/.
+
+    PATCH renames. DELETE **archives**: the organisation stops accepting
+    sign-ins (like suspension) and drops out of the default list, but every
+    row it owns stays where it is. Purging a tenant's data is a deliberate,
+    separate act with its own retention rules, not something a button on a
+    list page does.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def patch(self, request, pk):
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+        name = str(request.data.get("name", "")).strip()
+        if not name:
+            return _error("INVALID_NAME", "Give the organisation a name.")
+        previous = organisation.name
+        organisation.name = name
+        organisation.save(update_fields=["name"])
+        audit.record(  # SOC2:LOG-01
+            "platform.organisation.updated",
+            request=request,
+            actor=request.user,
+            organisation=organisation,
+            target=organisation,
+            metadata={"fields": ["name"], "from": previous, "to": name},
+        )
+        return Response(
+            {"id": organisation.id, "name": organisation.name, "slug": organisation.slug}
+        )
+
+    def delete(self, request, pk):
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+        reason = str(request.data.get("reason", "")).strip()
+        if not reason:
+            return _error("REASON_REQUIRED", "Say why; it goes on the record.")
+        previous = organisation.status
+        Organisation.objects.filter(pk=pk).update(status=Organisation.Status.ARCHIVED)
+        audit.record(  # SOC2:LOG-01
+            "platform.organisation.status",
+            request=request,
+            actor=request.user,
+            organisation=organisation,
+            target=organisation,
+            metadata={"from": previous, "to": "archived", "reason": reason[:500]},
+        )
+        return Response({"status": Organisation.Status.ARCHIVED})
+
+    def get(self, request, pk):
+        organisation = Organisation.objects.filter(pk=pk).prefetch_related("domains").first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+
+        memberships = (
+            OrganizationMembership.objects.filter(organisation=organisation)
+            .select_related("user", "role", "department")
+            .order_by("-is_owner", "user__name")
+        )
+        recent = AuditEvent.objects.filter(organisation=organisation).order_by("-created_at")[:20]
+        counts = {
+            "members_active": sum(1 for m in memberships if m.status == "active"),
+            "pending_requests": AccessRequest.objects.filter(
+                organisation=organisation, status="pending"
+            ).count(),
+            "gmail": _gmail_counts([organisation.pk]).get(organisation.pk, NO_GMAIL),
+        }
+        return Response(
+            {
+                **_summary(organisation, counts),
+                "open_invitations": Invitation.objects.filter(
+                    organisation=organisation, status="pending"
+                ).count(),
+                "memberships": [
+                    {
+                        "id": m.id,
+                        "user_id": m.user_id,
+                        "name": m.user.name,
+                        "email": m.user.email,
+                        "role": m.role.name if m.role_id else None,
+                        "department": m.department.name if m.department_id else None,
+                        "status": m.status,
+                        "is_owner": m.is_owner,
+                        "is_active": m.user.is_active,
+                        "approved_at": m.approved_at,
+                        "last_login": m.user.last_login,
+                    }
+                    for m in memberships
+                ],
+                "domains": [
+                    {
+                        "id": d.id,
+                        "domain": d.domain,
+                        "is_primary": d.is_primary,
+                        "verification_status": d.verification_status,
+                        "verified_at": d.verified_at,
+                    }
+                    for d in organisation.domains.all()
+                ],
+                "recent_events": [
+                    {
+                        "action": e.action,
+                        "actor": e.actor_email,
+                        "outcome": e.outcome,
+                        "target": e.target_repr,
+                        "at": e.created_at,
+                    }
+                    for e in recent
+                ],
+            }
+        )
+
+
+class OrganisationGmailView(views.APIView):
+    """POST /api/v1/platform/organisations/<id>/gmail/ — { enabled, reason }.
+
+    The pilot approval for two-way Gmail. Off pauses every Google mailbox in
+    the workspace at the mail loop's next gate sweep (within a minute); on
+    resumes them. Nothing is deleted. Staff also add each pilot user as a
+    test user in Google Cloud: Google refuses anyone else. A no-op answers
+    200 without an audit row.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def post(self, request, pk):
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+        enabled = request.data.get("enabled")
+        if not isinstance(enabled, bool):
+            return _error("INVALID_ENABLED", "Say whether Gmail is on: true or false.")
+        reason = str(request.data.get("reason", "")).strip()
+        if not reason:
+            return _error("REASON_REQUIRED", "Say why; it goes on the record.")
+        previous = organisation.gmail_two_way_enabled
+        if previous != enabled:
+            Organisation.objects.filter(pk=pk).update(gmail_two_way_enabled=enabled)
+            audit.record(  # SOC2:LOG-01
+                "platform.organisation.gmail_two_way",
+                request=request,
+                actor=request.user,
+                organisation=organisation,
+                target=organisation,
+                metadata={"from": previous, "to": enabled, "reason": reason[:500]},
+            )
+        counts = _gmail_counts([organisation.pk]).get(organisation.pk, NO_GMAIL)
+        return Response({"gmail": {"enabled": enabled, **counts}})
+
+
+class OrganisationDomainVerifyView(views.APIView):
+    """POST /api/v1/platform/organisations/<id>/domains/<domain_id>/verify/ — { reason }.
+
+    For a domain that cannot carry a TXT record, such as a Google-owned
+    `*.onworkspace.com` Workspace address: staff confirm ownership out of band
+    and vouch for it here (`domains.verify_by_staff`). Never a personal domain,
+    never one another workspace proved in DNS. A no-op answers 200 without an
+    audit row.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def post(self, request, pk, domain_pk):
+        domain = (
+            OrganizationDomain.objects.select_related("organisation")
+            .filter(pk=domain_pk, organisation_id=pk)
+            .first()
+        )
+        if domain is None:
+            return _error("DOMAIN_NOT_FOUND", "No such domain.", status.HTTP_404_NOT_FOUND)
+        reason = str(request.data.get("reason", "")).strip()
+        if not reason:
+            return _error("REASON_REQUIRED", "Say why; it goes on the record.")
+        try:
+            domains.verify_by_staff(domain, reason=reason, request=request, actor=request.user)
+        except domains.StaffVerifyRefused as refused:
+            return _error(refused.code, refused.message)
+        domain.refresh_from_db()
+        return Response(
+            {
+                "id": domain.id,
+                "domain": domain.domain,
+                "verification_status": domain.verification_status,
+                "verified_at": domain.verified_at,
+            }
+        )
+
+
+class OrganisationStatusView(views.APIView):
+    """POST /api/v1/platform/organisations/<id>/status/ — { status, reason }.
+
+    Suspending is the platform's one blunt instrument: sign-in is refused and
+    every member's capabilities resolve to nothing until reactivated. Nothing
+    is deleted. The reason is required because this lands in the tenant's
+    own audit trail.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def post(self, request, pk):
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+
+        new_status = str(request.data.get("status", ""))
+        allowed = {
+            Organisation.Status.ACTIVE,
+            Organisation.Status.SUSPENDED,
+            Organisation.Status.ARCHIVED,
+        }
+        if new_status not in allowed:
+            return _error("INVALID_STATUS", "Status must be active, suspended or archived.")
+        reason = str(request.data.get("reason", "")).strip()
+        if not reason:
+            return _error("REASON_REQUIRED", "Say why; it goes on the record.")
+
+        previous = organisation.status
+        Organisation.objects.filter(pk=pk).update(status=new_status)
+        audit.record(  # SOC2:LOG-01
+            "platform.organisation.status",
+            request=request,
+            actor=request.user,
+            organisation=organisation,
+            target=organisation,
+            metadata={"from": previous, "to": new_status, "reason": reason[:500]},
+        )
+        return Response({"status": new_status})
+
+
+class OrganisationOwnerView(views.APIView):
+    """POST /api/v1/platform/organisations/<id>/owner/ — { user_id }.
+
+    The platform route for a transfer the owner cannot make themselves (they
+    left, or their account is gone). Audited with by_platform=true.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def post(self, request, pk):
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+        try:
+            membership = ownership.transfer(
+                organisation,
+                to_user_id=request.data.get("user_id"),
+                actor=request.user,
+                request=request,
+                by_platform=True,
+            )
+        except ownership.OwnershipError as exc:
+            return _error(exc.code, exc.message)
+        return Response({"owner": _owner(organisation), "membership_id": membership.id})
+
+
+class StaffListView(views.APIView):
+    """GET /api/v1/platform/staff/ — who holds platform access, and whether
+    their second factor is on. The list an access review starts from."""
+
+    permission_classes = [IsPlatformStaff]
+
+    def get(self, request):
+        from services.accounts.models import TOTPDevice
+
+        enrolled = set(
+            TOTPDevice.objects.filter(confirmed_at__isnull=False).values_list("user_id", flat=True)
+        )
+        staff = User.objects.filter(is_superuser=True).order_by("email")
+        return Response(
+            [
+                {
+                    "id": u.id,
+                    "name": u.name,
+                    "email": u.email,
+                    "is_active": u.is_active,
+                    "mfa_enrolled": u.id in enrolled,
+                    "last_login": u.last_login,
+                }
+                for u in staff
+            ]
+        )
+
+
+class OrganisationBillingView(views.APIView):
+    """GET /api/v1/platform/organisations/<id>/billing/ — plan, seats, credits
+    and the last fifty ledger rows. The staff view of what a tenant has and
+    has used; the tenant sees the same numbers at /api/v1/billing/."""
+
+    permission_classes = [IsPlatformStaff]
+
+    def get(self, request, pk):
+        from services.billing import accounts as billing_accounts
+        from services.billing.models import CreditLedger, Plan
+        from services.billing.views import _serialise_row
+
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+        account = billing_accounts.ensure(organisation)
+        rows = CreditLedger.objects.filter(account=account).select_related("actor")[:50]
+        return Response(
+            {
+                **billing_accounts.summary(account),
+                "stripe_customer_id": account.stripe_customer_id,
+                "stripe_subscription_id": account.stripe_subscription_id,
+                "ledger": [_serialise_row(r) for r in rows],
+                "plans": [
+                    {
+                        "code": p.code,
+                        "name": p.name,
+                        "seats_included": p.seats_included,
+                        "monthly_credits": p.monthly_credits,
+                    }
+                    for p in Plan.objects.all()
+                ],
+            }
+        )
+
+
+class OrganisationBillingActionView(views.APIView):
+    """POST /api/v1/platform/organisations/<id>/billing/<action>/
+
+        credits/  { amount, reason }      signed; a manual ledger adjustment
+        seats/    { seats_limit, reason }  the allowance, never below seats in use
+        plan/     { plan_code, reason }    puts the account on a plan and grants its credits
+
+    Every one needs a reason and lands on the tenant's own audit trail.
+    """
+
+    permission_classes = [IsPlatformStaff]
+
+    def post(self, request, pk, action):
+        from services.billing import accounts as billing_accounts
+        from services.billing import ledger
+        from services.billing.models import Plan
+
+        organisation = Organisation.objects.filter(pk=pk).first()
+        if organisation is None:
+            return _error(
+                "ORGANIZATION_NOT_FOUND", "No such organisation.", status.HTTP_404_NOT_FOUND
+            )
+        account = billing_accounts.ensure(organisation)
+        reason = str(request.data.get("reason", "")).strip()
+        try:
+            if action == "credits":
+                try:
+                    amount = int(request.data.get("amount", 0))
+                except (TypeError, ValueError):
+                    return _error("INVALID_AMOUNT", "Amount must be a whole number.")
+                ledger.adjust(account, amount, reason=reason, actor=request.user, request=request)
+            elif action == "seats":
+                try:
+                    seats_limit = int(request.data.get("seats_limit", -1))
+                except (TypeError, ValueError):
+                    return _error("INVALID_AMOUNT", "Seats must be a whole number.")
+                billing_accounts.set_seats(
+                    account, seats_limit, actor=request.user, reason=reason, request=request
+                )
+            elif action == "plan":
+                plan = Plan.objects.filter(code=str(request.data.get("plan_code", ""))).first()
+                if plan is None:
+                    return _error("PLAN_NOT_FOUND", "No such plan.")
+                if not reason:
+                    return _error("REASON_REQUIRED", "Say why; it goes on the record.")
+                billing_accounts.change_plan(
+                    account, plan, actor=request.user, reason=reason, request=request
+                )
+            else:
+                return _error(
+                    "INVALID_ACTION",
+                    "Action must be credits, seats or plan.",
+                    status.HTTP_404_NOT_FOUND,
+                )
+        except ledger.BillingError as exc:
+            return _error(exc.code, exc.message)
+        account.refresh_from_db()
+        return Response(billing_accounts.summary(account))
